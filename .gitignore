@@ -6,3 +6,5 @@ results/
 .env*
 *token*
 *.log
+baseline_original/
+offline_check/

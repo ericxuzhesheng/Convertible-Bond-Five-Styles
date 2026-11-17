@@ -1,0 +1,4 @@
+ts_code,trade_date,open,high,low,close,vol,source,unit_check
+110070.SH,20250328,115.7,116.2,115.499,115.925,11525,akshare.bond_cb_daily_sina:sh110070,20250331_Sina71920_equals_Tushare7192_times10
+113050.SH,20250328,127.152,127.553,127,127.188,76607,akshare.bond_cb_daily_sina:sh113050,20250331_Sina1849350_equals_Tushare184935_times10
+113065.SH,20250328,124.834,125.347,124.5,124.694,59772,akshare.bond_cb_daily_sina:sh113065,20250331_Sina736670_equals_Tushare73667_times10

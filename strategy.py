@@ -225,7 +225,78 @@ WHERE b.cb_type='CB' AND d.close>0 AND d.vol>0
 """
 
 
-def build_signals(db, start, end, fraction):
+def risk_available(announcement, effective):
+    return max(ymd(pd.Timestamp(announcement) + pd.Timedelta(days=1)), effective)
+
+
+def prepare_risk(db, end, offline):
+    import tushare as ts
+    pro = None if offline else ts.pro_api(os.environ["TUSHARE_TOKEN"], timeout=30)
+    mapping = paged(db, pro, "cb_basic", {"_snapshot": end, "fields": "ts_code,stk_code"}, offline)
+    mapping.to_sql("bond_stock_map", db, if_exists="replace", index=False)
+    names = paged(db, pro, "namechange", {"start_date": "19900101", "end_date": end,
+                  "fields": "ts_code,name,start_date,end_date,ann_date,change_reason"}, offline)
+    names = names.rename(columns={"ts_code": "stk_code"}).merge(mapping, on="stk_code")
+    names = names.dropna(subset=["ann_date", "start_date"])
+    names["effective_date"] = names.start_date
+    names["risk_type"] = "stock_name"
+    names["blocked"] = names.name.str.contains("ST|退", case=False, regex=True).astype(int)
+    events = pd.read_csv(ROOT / "risk_events.csv", dtype={"ann_date": str, "effective_date": str})
+    events = pd.concat([events[events.risk_type != "stock_name"], names], ignore_index=True)
+    events["available"] = events.apply(lambda r: risk_available(r.ann_date, r.effective_date), axis=1)
+    events = events.sort_values(["available", "ann_date", "effective_date"], kind="stable")
+    dates = pd.read_sql_query("SELECT cal_date FROM calendar ORDER BY cal_date", db).cal_date
+    state, rows, cursor = {}, [], 0
+    records = events.to_dict("records")
+    for date in dates:
+        while cursor < len(records) and records[cursor]["available"] <= date:
+            event = records[cursor]
+            state[(event["ts_code"], event["risk_type"])] = int(event["blocked"])
+            cursor += 1
+        unknown = set(mapping.ts_code) - {code for code, kind in state if kind == "stock_name"}
+        rows.extend((date, code) for code in sorted(unknown | {k[0] for k, v in state.items() if v}))
+    frame = pd.DataFrame(rows, columns=["trade_date", "ts_code"])
+    frame.to_sql("risk_blocked", db, if_exists="replace", index=False)
+    db.execute("CREATE UNIQUE INDEX risk_blocked_pk ON risk_blocked(trade_date,ts_code)")
+    return {date: set(group.ts_code) for date, group in frame.groupby("trade_date")}
+
+
+def apply_quote_overrides(db):
+    path = ROOT / "quote_overrides.csv"
+    if not path.exists():
+        return
+    quotes = pd.read_csv(path, dtype={"trade_date": str})
+    unique(quotes, ["ts_code", "trade_date"], "quote overrides")
+    quotes.to_sql("quote_overrides", db, if_exists="replace", index=False)
+    for row in quotes.to_dict("records"):
+        if not (0 < row["low"] <= min(row["open"], row["close"]) <= max(row["open"], row["close"]) <= row["high"] and row["vol"] > 0):
+            raise ValueError("Invalid supplemental quote")
+        existing = db.execute("SELECT close FROM bars WHERE ts_code=? AND trade_date=?", (row["ts_code"],row["trade_date"])).fetchone()
+        if existing:
+            if abs(existing[0]-row["close"]) > .01:
+                raise ValueError("Conflicting supplemental quote; review provider revision")
+            continue
+        db.execute("INSERT INTO bars(ts_code,trade_date,open,high,low,close,vol) VALUES (?,?,?,?,?,?,?)",
+                   tuple(row[k] for k in ["ts_code","trade_date","open","high","low","close","vol"]))
+    db.commit()
+
+
+def confirmed_halt(db, code, date, offline):
+    # Since the 2022 CB trading rules, an underlying full-day suspension also suspends its CB.
+    # This explains a close mark only; it never supplies an execution price.
+    if date < "20220801":
+        return False
+    stock = db.execute("SELECT stk_code FROM bond_stock_map WHERE ts_code=?", (code,)).fetchone()
+    if not stock:
+        raise ValueError(f"Missing underlying mapping: {code}")
+    import tushare as ts
+    pro = None if offline else ts.pro_api(os.environ["TUSHARE_TOKEN"], timeout=30)
+    rows = cached(db, "tushare.suspend_d", {"ts_code": stock[0], "trade_date": date},
+                  lambda **kw: pro.suspend_d(**kw), offline)
+    return not rows.empty and bool(((rows.suspend_type == "S") & rows.suspend_timing.isna()).any())
+
+
+def build_signals(db, start, end, fraction, risk=False):
     db.execute("DROP VIEW IF EXISTS factors")
     db.executescript(FACTOR_SQL)
     dates = pd.read_sql_query("SELECT cal_date FROM calendar ORDER BY cal_date", db).cal_date.tolist()
@@ -239,13 +310,15 @@ def build_signals(db, start, end, fraction):
     selections = []
     for signal, execution in schedule:
         for style in STYLES:
+            risk_clause = "AND close>=90 AND ts_code NOT IN (SELECT ts_code FROM risk_blocked WHERE trade_date=?)" if risk else ""
             frame = pd.read_sql_query(f"""
                 SELECT ts_code,bond_short_name,{style} AS factor,
                        ROW_NUMBER() OVER(ORDER BY {style},ts_code) AS rank,
                        COUNT(*) OVER() AS universe_count
                 FROM factors WHERE trade_date=? AND {style} IS NOT NULL
                   AND (? != 'balanced' OR (bond_value>0 AND cb_value>0))
-                ORDER BY rank""", db, params=(signal, style))
+                  {risk_clause}
+                ORDER BY rank""", db, params=(signal, style, execution) if risk else (signal, style))
             if frame.empty:
                 raise ValueError(f"Empty factor universe: {signal} {style}")
             n = max(1, round(len(frame) * fraction))
@@ -317,7 +390,7 @@ def rebalance(positions, cash, opens, targets, cost):
     return {**frozen, **target}, max(0., cash_after), fees, trades
 
 
-def backtest(db, signals, start, end, cost, offline):
+def backtest(db, signals, start, end, cost, offline, risk_blocks=None):
     verified_file = ROOT / "verified_redemptions.csv"
     if verified_file.exists():
         for event in pd.read_csv(verified_file, dtype=str).to_dict("records"):
@@ -328,6 +401,9 @@ def backtest(db, signals, start, end, cost, offline):
             put_redemption(db, (event["ts_code"], ann, record, pay, price), event["source"])
     bars = pd.read_sql_query("SELECT * FROM bars ORDER BY trade_date,ts_code", db)
     by_date = {d: f.set_index("ts_code") for d, f in bars.groupby("trade_date")}
+    previous_closes = bars.sort_values(["ts_code", "trade_date"]).groupby("ts_code").close.shift()
+    price_risk = bars.assign(previous_close=previous_closes)
+    price_risk = {d: set(f.ts_code) for d, f in price_risk[price_risk.previous_close < 90].groupby("trade_date")}
     dates = pd.read_sql_query("SELECT cal_date FROM calendar WHERE cal_date BETWEEN ? AND ? ORDER BY cal_date", db,
                               params=(start, end)).cal_date
     nav_rows, trade_rows, issue_rows, holding_rows = [], [], [], []
@@ -360,9 +436,10 @@ def backtest(db, signals, start, end, cost, offline):
                     if not mark_present:
                         # Announced redemption creates a known non-trading interval before registration.
                         pending = event and event[0] < date <= event[1] and (pd.Timestamp(event[1])-pd.Timestamp(date)).days <= 10
-                        if pending:
+                        halted = risk_blocks is not None and confirmed_halt(db, code, date, offline)
+                        if pending or halted:
                             pending_codes.add(code)
-                            issue_rows.append((date, style, code, "redemption_pending_stale_mark"))
+                            issue_rows.append((date, style, code, "confirmed_halt_stale_mark" if halted else "redemption_pending_stale_mark"))
                         else:
                             tainted = True
                             issue_rows.append((date, style, code, "missing_quote_unresolved"))
@@ -370,13 +447,27 @@ def backtest(db, signals, start, end, cost, offline):
                         issue_rows.append((date, style, code, "nontrading_provider_mark"))
             tradable = day[(day.open > 0) & (day.vol > 0) & day.open.notna()]
             opens = tradable.open.to_dict()
+            blocked = set() if risk_blocks is None else risk_blocks.get(date, set()) | price_risk.get(date, set())
+            for code in list(positions):
+                if code in blocked:
+                    if code in opens:
+                        quantity = positions.pop(code)
+                        fee = quantity * opens[code] * cost
+                        cash += quantity * opens[code] - fee
+                        fees += fee
+                        trade_rows.append((date, style, code, -quantity, opens[code], fee, "risk_exit"))
+                        marks.pop(code, None)
+                    else:
+                        issue_rows.append((date, style, code, "risk_exit_frozen"))
             selected = signals[(signals["style"] == style) & (signals.execution_date == date)]
             if not selected.empty:
                 targets = selected.ts_code.tolist()
+                opens = {c: price for c, price in opens.items() if c not in blocked}
                 for code in targets:
                     if code not in opens:
                         issue_rows.append((date, style, code, "entry_unfilled_cash_slot"))
-                positions, cash, fees, trades = rebalance(positions, cash, opens, targets, cost)
+                positions, cash, rebalance_fees, trades = rebalance(positions, cash, opens, targets, cost)
+                fees += rebalance_fees
                 for code, quantity, price in trades:
                     trade_rows.append((date, style, code, quantity, price, abs(quantity) * price * cost, "weekly_open"))
                     marks.setdefault(code, price)
@@ -479,6 +570,9 @@ def export(db, out, args):
     manifest = {"generated_at": datetime.now().astimezone().isoformat(), "start": args.start, "end": args.end,
                 "frequency": "weekly", "signal": "prior session close", "execution": "next week first session open",
                 "one_way_cost_bps": args.cost_bps, "fraction": args.fraction,
+                "risk_policy": {"price_floor": 90, "stock_ST_or_delisting": "exclude and exit", "unknown_name_history": "exclude",
+                                "redemption_and_trading_termination": "exclude and exit after announcement", "announcement_lag": "next calendar day, executed on next trading session",
+                                "risk_exit_frequency": "daily", "normal_rebalance": "weekly"},
                 "limitations": ["Regular coupons excluded; not total return", "Daily data cannot guarantee open auction fills or capacity",
                                 "Provider history can be revised; no original-release vintage guarantee",
                                 "Unresolved held marks invalidate subsequent performance; inspect issues.csv"],
@@ -491,6 +585,9 @@ def export(db, out, args):
 def self_test():
     import unittest
     class Contracts(unittest.TestCase):
+        def test_risk_information_delay(self):
+            self.assertEqual(risk_available('20251013','20251013'),'20251014')
+            self.assertEqual(risk_available('20251010','20251020'),'20251020')
         def test_fee_and_fixed_quantity(self):
             pos, cash, fee, _ = rebalance({}, 1., {"A": 100.}, ["A"], .001)
             self.assertAlmostEqual(pos["A"], 1 / 1.001 / 100)
@@ -546,6 +643,45 @@ def self_test():
             np.testing.assert_allclose(nav.nav, [1., 1.1, 1.025])
             self.assertTrue(nav.valid.all())
             self.assertEqual(set(result["trades"].query("reason == 'weekly_open'").trade_date), {dates[0]})
+        def test_price_risk_exits_next_open(self):
+            db = sqlite3.connect(":memory:")
+            dates = ["20251013", "20251014"]
+            pd.DataFrame({"cal_date": dates}).to_sql("calendar", db, index=False)
+            pd.DataFrame([{"trade_date": dates[0], "ts_code": "A", "open": 100., "close": 80., "vol": 1},
+                          {"trade_date": dates[1], "ts_code": "A", "open": 70., "close": 90., "vol": 1}]).to_sql("bars", db, index=False)
+            db.execute("CREATE TABLE redemptions (ts_code TEXT PRIMARY KEY,ann_date TEXT,record_date TEXT,payment_date TEXT,price REAL,source TEXT)")
+            sig = pd.DataFrame([{"style": style, "execution_date": dates[0], "ts_code": "A"} for style in STYLES])
+            result = backtest(db, sig, dates[0], dates[-1], 0., True, {})
+            frame = result["nav"].query("style == 'equity'")
+            np.testing.assert_allclose(frame.nav, [.8, .7])
+            exits = result["trades"].query("reason == 'risk_exit'")
+            self.assertEqual(set(exits.trade_date), {dates[1]})
+            self.assertTrue((exits.price == 70.).all())
+        def test_risk_exit_waits_for_trading(self):
+            db = sqlite3.connect(":memory:")
+            dates = ['20251013','20251014','20251015']
+            pd.DataFrame({'cal_date':dates}).to_sql('calendar',db,index=False)
+            pd.DataFrame([{'trade_date':d,'ts_code':'A','open':o,'close':p,'vol':v}
+                          for d,o,p,v in [(dates[0],100.,100.,1),(dates[1],0.,100.,0),(dates[2],80.,85.,1)]]).to_sql('bars',db,index=False)
+            db.execute('CREATE TABLE redemptions (ts_code TEXT PRIMARY KEY,ann_date TEXT,record_date TEXT,payment_date TEXT,price REAL,source TEXT)')
+            db.execute("INSERT INTO redemptions VALUES ('A','20300101','20300102','20300103',100,'future')")
+            sig = pd.DataFrame([{'style':style,'execution_date':dates[0],'ts_code':'A'} for style in STYLES])
+            result = backtest(db,sig,dates[0],dates[-1],0.,True,{dates[1]:{'A'},dates[2]:{'A'}})
+            exits = result['trades'].query("reason == 'risk_exit'")
+            self.assertEqual(set(exits.trade_date),{dates[2]})
+            self.assertTrue((exits.price == 80.).all())
+            self.assertEqual(len(result['issues'].query("issue == 'risk_exit_frozen'")),5)
+        def test_risk_filter_precedes_ranking(self):
+            db = sqlite3.connect(":memory:")
+            pd.DataFrame({"cal_date": ["20251010", "20251013"]}).to_sql("calendar", db, index=False)
+            pd.DataFrame([{"ts_code": c,"bond_short_name": c,"cb_type":"CB","list_date":"20200101","delist_date":None}
+                          for c in ["A","B"]]).to_sql("bonds", db, index=False)
+            pd.DataFrame([{"trade_date":"20251010","ts_code":c,"close":100.,"vol":1.,"cb_value":100.,"bond_value":90.,
+                           "cb_over_rate":1. if c=='A' else 2.,"bond_over_rate":10.} for c in ['A','B']]).to_sql('bars',db,index=False)
+            pd.DataFrame([{"trade_date":"20251013","ts_code":"A"}]).to_sql('risk_blocked',db,index=False)
+            sig = build_signals(db,'20251013','20251013',.1,True)
+            self.assertEqual(set(sig.ts_code), {'B'})
+            self.assertTrue((sig.universe_count == 1).all())
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Contracts))
     if not result.wasSuccessful():
         raise SystemExit(1)
@@ -578,9 +714,11 @@ def main():
             bounds = db.execute("SELECT start,end FROM sync_state").fetchone()
             if not bounds or args.start < bounds[0] or args.end > bounds[1]:
                 raise ValueError("Requested research dates exceed synchronized history; run sync first")
-            signals = build_signals(db, args.start, args.end, args.fraction)
+            apply_quote_overrides(db)
+            risk_blocks = prepare_risk(db, args.end, args.offline)
+            signals = build_signals(db, args.start, args.end, args.fraction, risk=True)
             fit_curve(db)
-            backtest(db, signals, args.start, args.end, args.cost_bps / 10000, args.offline)
+            backtest(db, signals, args.start, args.end, args.cost_bps / 10000, args.offline, risk_blocks)
             crosscheck(db, args.check_code, args.end, args.offline)
             export(db, args.out, args)
 

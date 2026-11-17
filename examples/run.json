@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-17T17:27:28.526658+08:00",
+  "generated_at": "2026-11-17T18:43:13.911311+08:00",
   "start": "20190101",
   "end": "20261116",
   "frequency": "weekly",
@@ -7,6 +7,15 @@
   "execution": "next week first session open",
   "one_way_cost_bps": 5.0,
   "fraction": 0.1,
+  "risk_policy": {
+    "price_floor": 90,
+    "stock_ST_or_delisting": "exclude and exit",
+    "unknown_name_history": "exclude",
+    "redemption_and_trading_termination": "exclude and exit after announcement",
+    "announcement_lag": "next calendar day, executed on next trading session",
+    "risk_exit_frequency": "daily",
+    "normal_rebalance": "weekly"
+  },
   "limitations": [
     "Regular coupons excluded; not total return",
     "Daily data cannot guarantee open auction fills or capacity",
@@ -16,8 +25,8 @@
   "sources": [
     {
       "source": "akshare.bond_cb_info_em",
-      "cache_entries": 37,
-      "last_fetched_at": "2026-11-17T17:17:05.857309+08:00"
+      "cache_entries": 39,
+      "last_fetched_at": "2026-11-17T18:33:20.506958+08:00"
     },
     {
       "source": "akshare.bond_cb_value_analysis_em",
@@ -26,8 +35,8 @@
     },
     {
       "source": "tushare.cb_basic",
-      "cache_entries": 2,
-      "last_fetched_at": "2026-11-17T17:00:47.482708+08:00"
+      "cache_entries": 3,
+      "last_fetched_at": "2026-11-17T18:37:13.010116+08:00"
     },
     {
       "source": "tushare.cb_daily",
@@ -38,6 +47,16 @@
       "source": "tushare.cb_share",
       "cache_entries": 55,
       "last_fetched_at": "2026-11-17T17:13:36.796779+08:00"
+    },
+    {
+      "source": "tushare.namechange",
+      "cache_entries": 8,
+      "last_fetched_at": "2026-11-17T18:37:28.785064+08:00"
+    },
+    {
+      "source": "tushare.suspend_d",
+      "cache_entries": 145,
+      "last_fetched_at": "2026-11-17T18:39:23.860740+08:00"
     },
     {
       "source": "tushare.trade_cal",

@@ -1,140 +1,98 @@
 # 可转债五类周度风格策略
 
-一个 `strategy.py` 完成 **Tushare 取数 → SQLite 存储和排名 → 每周调仓 → 每日记账 → 百元平价估值 → AKShare 交叉核对 → 图表及 CSV**。
+一个 `strategy.py` 完成 Tushare / AKShare 取数、SQLite 存储、五风格选券、风险退出、每日记账和结果导出。无需 Excel、VBA、Wind 或 iFinD。
 
-这是将原有五类组合和反比例估值代码合并的独立研究实现。运行不需要 Excel、VBA、iFinD、Wind，也不调用其他仓库的定价模型。默认历史从 **2019-01-01** 开始，到上海时区的昨日；起止日期可修改。
+**当前版本已完成 2019-01-02 至 2026-11-16 的五组合全区间回测，1,908 个交易日均有有效账本。** 这是加入风险过滤与退出规则后的版本；收益采用价格收益口径，不含常规年度票息。完整验证见 [VALIDATION.md](VALIDATION.md)。
 
-**验证状态**：已实际抓取 2019–2026-11-16 历史并运行五个周度组合。历史中存在退市、违约和重整券的未解决估值，故不发布完整区间收益率；`metrics.csv` 标出各组合有效截止日，图仅显示有效部分。原始问题保留在 `issues.csv`。这份实现是可审计的研究工具，尚不是完整总回报回测。
+![五类组合净值和回撤](examples/weekly_styles.png)
 
-实际检查结果、截止日与图表见 [验证记录](VALIDATION.md)。
+## 五类指标
 
-## 五个风格具体做什么
+每周按指标升序取合格池最低 10%，数量为 `max(1, round(N*0.1))`，同分按代码排序，调仓时等金额配置。
 
-每个信号日，对当日有效可转债按对应指标升序排列，取最低 10%，下一交易周首个交易日开盘等金额配置。
+| 风格 | 排序指标 |
+|---|---|
+| 偏股 | 转股溢价率 |
+| 偏债 | 纯债溢价率 |
+| 低价 | 转债收盘价 |
+| 双低 | 收盘价 + 转股溢价率（百分点） |
+| 平衡 | `abs(转股平价 / 纯债价值 - 1)` |
 
-| 风格 | 排序指标 | 指标要回答的问题 |
-|---|---|---|
-| 偏股型 | 转股溢价率 `cb_over_rate` | 买转债比直接持有对应股票贵多少？ |
-| 偏债型 | 纯债溢价率 `bond_over_rate` | 转债价格离估计债底有多远？ |
-| 低价 | 转债收盘价 `close` | 哪些券的绝对价格较低？ |
-| 双低 | `close + cb_over_rate` | 同时兼顾绝对价格和转股溢价率 |
-| 平衡型 | `abs(cb_value / bond_value - 1)` | 转股平价与纯债价值是否接近？ |
+例如价格 120、转股溢价率 20%，双低值是 **140**。五个组合可重叠。低溢价率不保证低风险。
 
-**单位不能混用**：API 的转股溢价率用百分点，20% 存为 `20`。价格 120、溢价率 20% 的双低值是 **140**。平衡型按原表公式保留相对距离；不是两种溢价率的和。
+## 风险与交易规则
 
-这些名称表示选券特征，不能保证实际风险暴露。低价券、低纯债溢价率券也可能存在信用风险。五个组合可能重叠；没有加入风格择时、机器学习或原宏中关闭的高 YTM/负偏离策略。
+- 正常选券、再平衡按周：上一周末收盘指标，下一周首个交易日开盘成交。节假日使用交易日历；起点在周中时，首次建仓用前一交易日指标。
+- 风险过滤先于分位排名。剔除正股已知 ST/退市风险、已公告赎回/停止交易，以及前一日收盘价低于 **90 元**的转债。90 元是固定研究参数，未根据收益优化。
+- 股票名称历史由 Tushare 全市场 `namechange` 分页获取，与转债正股映射连接；没有可核验名称历史时不当作风险已排除。事件公告日后才生效，并尊重名称正式生效日，避免使用当天公告的未知发布时间。
+- 周末到开盘前已公开的新风险同样阻止买入。风险日常检查，已持有风险券在下一可交易日开盘退出；正常轮换仍是周度。风险退出不等同每日重排组合。
+- 周内数量保持不变，权重随价格漂移。买不到的额度留现金，不找替代券；卖不掉的持仓冻结，不能假设停牌前已退出。
+- 已确认的整日停牌，仅沿用最后估值并标记 `confirmed_halt_stale_mark`；这不是可成交价格。复牌时按实际行情计入跳变。停牌记录来自 `suspend_d`，结合股票与转债同时停复牌的规则核对。
+- 买卖均按成交额扣除单边 5bp，总摩擦参数可调整。允许碎份额，不模拟最小交易单位、盘口容量或排队成交；日线开盘成交属于研究近似，不是实盘成交保证。
+- 已识别的赎回按登记日和付款日记应收款、现金，保留公告来源。任何无法解释的持仓价格缺失仍使后续绩效无效，绝不默认兑付面值或用零收益隐藏缺失。
 
-## 快速运行
+原五风格选券思路来自原工作表、Python 及东北证券《可转债研究框架：从理论到策略》（2024-08-23，第 28–29、33 页）。本版本按使用者确认加入上述风险规则，故不可与未过滤的旧净值直接视为同一策略。
 
-Python 3.11+，在本目录执行：
+## 运行
+
+Python 3.11+，在项目目录：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-# 在本机环境中配置 TUSHARE_TOKEN；不要写进源码或提交到 GitHub。
+# 在本机环境设置 TUSHARE_TOKEN，勿写入源码或 Git。
 .\.venv\Scripts\python.exe strategy.py self-test
 .\.venv\Scripts\python.exe strategy.py run --start 20190101 --end 20261116
 ```
 
-第一次需要较多接口请求；数据按分页缓存，失败后相同命令从已完成请求继续。Tushare 账号需具备 `trade_cal`、`cb_basic`、`cb_daily`、`cb_share` 权限。权限或接口错误会直接报出，不会生成模拟数据代替。
-
-可分开取数与研究：
+需要 Tushare 的 `cb_basic`、`cb_daily`、`cb_share`、`trade_cal`、`namechange`、`suspend_d` 权限。网络中断有限重试；权限和数据错误直接报出。请求分页缓存可续跑，不生成模拟数据替代。
 
 ```powershell
-python strategy.py sync --start 20190101 --end 20261116
+# 已有本地数据库时重算
 python strategy.py research --start 20190101 --end 20261116
-# 已成功跑过完全相同的区间及核对标的后，可离线重算：
+# 相同参数在线运行成功后，完全离线重现
 python strategy.py research --start 20190101 --end 20261116 --offline
-```
-
-可复用本机其他仓库的东方财富赎回快照（只读）：
-
-```powershell
+# 可选：只读复用另一个仓库的赎回快照，核对日行情覆盖
 python strategy.py run --start 20190101 --end 20261116 --reuse-repo "D:\Github Repository\Convertible-Bond-Pricing-Research"
 ```
 
-复用路径是 `backtest/strategy_inputs/source_checks/eastmoney_all_basic.csv`。缺少所需个券事件时，再由 AKShare 查询。普通用户不提供这个参数，也可以运行。历史日行情、五风格估值和转股余额仍统一由 Tushare 获取，防止把其他仓库的周频模型结果当成日频观测值。
+`--db` 指定数据库，`--out` 指定结果目录，`--cost-bps` 指定单边摩擦，`--fraction` 指定底部分位，`--check-code` 指定 AKShare 核对个券。默认路径相对程序所在目录。
 
-提供复用路径时还会检查其 `strategy_inputs/daily` 的证券覆盖；发现月度分页缺行的日期，重新按单日从 Tushare 获取，不把不同源字段静默拼接。`verified_redemptions.csv` 是附带原始公告链接的人工核验事件补充，优先于供应商不完整记录；目前包含济川和太阳到期兑付。仍只有一个 Python 源文件。
+普通行情、名称与余额可随请求日期更新；附带的公告事件文件是经过本次历史核对的研究快照。扩展历史或用于日后信号前，必须更新公告事件并重新检查覆盖，不能将旧事件快照当成实时风险服务。
 
-参数：`--db` 指定 SQLite 文件，`--out` 指定结果目录，`--cost-bps` 指定单边总摩擦（默认 5bp），`--fraction` 指定底部比例（默认 0.1），`--check-code` 指定 AKShare 核对个券（默认兴业转债 `113052.SH`）。默认路径相对程序所在目录，与启动终端位置无关。
+## 数据补充和审计
 
-## 调仓和记账口径
+保持一个 Python 主程序，附带 CSV 是可审计的数据输入：
 
-1. **信号**：上一周最后一个交易日收盘后的指标。使用交易日历识别自然周，遇假期采用实际交易日；首次建仓使用起点之前最近一日的信号，因此起点若在周中，首次建仓会在周中。
-2. **选券**：当时已上市的普通可转债、正价格、有成交量；每个风格分别剔除其因子缺失值。历史退市券保留历史记录，不用当前存续券名单倒推。选券数为 `max(1, round(N*0.1))`，同分按代码稳定排序。
-3. **成交**：下一周首个交易日的开盘价；选券不读取下一周末是否还有数据。开盘价无效或当日无量，则对应买入额度留现金，不用其他券补位。日线无法证明开盘瞬间成交量或可成交性，这仍是日线成交近似。
-4. **周内**：数量固定、权重随价格漂移。只在周度调仓日再平衡；没有暗中每日恢复等权。停牌持仓不能凭空卖出，冻结部分保留，使用可用资金配置其他目标。
-5. **成本**：实际成交额乘单边 5bp，买卖均扣除；用数值解保证现金足够。允许碎份额，忽略最小交易单位和资金容量。
-6. **赎回**：使用有公告日、登记日、支付日和价格的历史记录。登记日后停止交易的持仓按赎回价转为应收款，到支付日再变现金；不会在最后一根 K 线上预知退市并卖出。历史事件是供应商回填记录，尚未逐条与原始公告核验。
-7. **缺失价格**：有供应商停牌收盘价时明确记录非交易估值；连收盘估值也缺失且无法通过赎回解释时，保留指示性账面值、记录问题，后续绩效设为无效并隐藏曲线对应部分。不得把这些指示值当作有效回测结果。
-8. **收益定义**：价格变动加已识别的终止赎回，**不含普通年度票息，不是完整总回报**。年化按 252 个交易日；最大回撤包括初始现金净值 1。没有优化参数或样本外收益承诺。
+- `risk_events.csv`：公告风险事件与来源。程序忽略其中早期名称历史条目，统一使用完整 `namechange` 历史计算 ST 状态。英科停止交易、天创到期公告等人工核验事件有原始公告链接。
+- `verified_redemptions.csv`：济川、太阳的到期兑付记录，覆盖供应商缺漏，附原始公告链接。
+- `quote_overrides.csv`：2025-03-28 的三条真实新浪历史行情补充，记录来源及相邻日成交量单位核对。只补 OHLCV，不编造缺失估值指标，也不覆盖冲突价格。
 
-原表的周内净值算法近似每日等权，而本实现采用周度再平衡后的固定数量。原表还包含未来数据筛选和缺失价格替代；因此这里复现的是五风格选券思想，不声称逐点复刻旧净值。
-
-已公告赎回且距离登记日不超过 10 个自然日的无报价持仓，暂按最后价格估值并标记 `redemption_pending_stale_mark`，登记日后转为赎回应收款。这是显式的短期停牌估值约定，并非可成交价格。其他无法解释的缺价仍使绩效失效；违约券绝不默认兑付 100 元或按最后价格虚构卖出。
-
-## 百元平价估值：与五组合放在同一程序
-
-每天拟合 `转股溢价率 = a + b / 转股平价`，保留原 Python 的 Huber 稳健回归：
-
-- `50 < 转股平价 < 130`；最新已披露剩余余额大于 1 亿元。
-- `publish_date < 信号日期`，避免假设当天公告盘前就能看到；按公告日和统计日选择历史余额，绝不拿今天的 `remain_size` 填历史。
-- 缺历史余额的券不进入拟合，并计入 `balance_missing_n`；有效样本少于 10 只时明确标为 `insufficient_sample`。
-- 市场估值指标为 **`a+b/100`**，单位百分点。它用来比较不同日期的市场估值中枢；不是第六个组合，也不自动解释为套利机会。
-
-余额来自最近已公开报告，可能滞后于实时实际余额；早期样本覆盖率见 `curve.csv`。回归失败或不收敛会报错。
-
-## 输出与 SQL
-
-本机数据在 `data/research.sqlite`，运行结果在 `results/`，默认均不进入 Git。
-
-| 表/文件 | 内容 |
-|---|---|
-| SQLite `cache` | API 请求参数、数据来源、抓取时间、完整分页结果 |
-| `bonds`、`bars`、`balances`、`calendar`、`redemptions` | 标准化原始数据和赎回事件 |
-| `factors` 视图 | SQL 计算五类因子 |
-| `signals.csv` | 每周信号日、执行日、选中券、排名、原始指标和目标权重 |
-| SQLite `holdings` | 每日持仓数量、估值和市值，可查权重漂移 |
-| `nav.csv`、`trades.csv`、`issues.csv` | 账本、实际换仓、未成交和数据问题 |
-| `curve.csv` | 反比例参数、百元平价溢价率、样本覆盖 |
-| `crosscheck.csv` | 同一日期 Tushare/AKShare 字段差异，不混用两源债底 |
-| `metrics.csv`、`annual_returns.csv` | 有效口径下的区间和年度表现 |
-| `coverage.csv`、`run.json` | 年度数据覆盖和本次参数、来源、限制 |
-| `weekly_styles.png` | 五类净值及回撤图 |
+SQLite 保留 `cache`（请求、来源、抓取时间）、`bars`、`bonds`、`balances`、`risk_blocked`、`quote_overrides`、`signals`、`trades`、`holdings`、`nav`、`issues` 等表。历史退市券保留，不用当前存续券名单倒推。
 
 ```sql
--- 看某周具体买了什么
-SELECT style, signal_date, execution_date, ts_code, bond_short_name,
-       factor, rank, universe_count, target_weight
-FROM signals WHERE execution_date='20261116' ORDER BY style, rank;
-
--- 追溯不能成交或估值不完整的持仓
-SELECT issue, COUNT(*) AS n FROM issues GROUP BY issue;
-
--- 检查余额缺失导致的样本损失
-SELECT trade_date, sample_n, balance_missing_n, premium_at_100
-FROM curve ORDER BY trade_date DESC LIMIT 10;
+SELECT style, signal_date, execution_date, ts_code, factor, target_weight
+FROM signals WHERE execution_date='20261116' ORDER BY style,rank;
+SELECT reason,COUNT(*) FROM trades GROUP BY reason;
+SELECT issue,COUNT(*) FROM issues GROUP BY issue;
 ```
 
-## 结合这个项目复习 pandas / NumPy
+## 百元平价估值
 
-- `pd.read_sql_query()`：从 SQLite 取数据；`to_sql()`：存标准化数据和研究结果。
-- `groupby('trade_date')`：每天独立处理截面，避免把所有日期放在一起排名。
-- `merge(..., validate='one_to_one')`：按日期核对两个源，重复键直接失败。
-- 布尔索引：`frame[(frame.cb_value > 50) & (frame.cb_value < 130)]`；用 `&`，每个条件加括号。
-- `np.diff(nav) / nav[:-1]`：相邻净值收益；首日必须补上初始资金 1，否则漏掉建仓日收益和费用。
-- `np.maximum.accumulate(nav)`：历史最高净值，用于计算回撤；不能只拿最后净值当分母。
-- `np.isfinite()`：拦截无穷值；缺失值与零收益有不同含义，不能一律 `fillna(0)`。
+按日拟合 `转股溢价率 = a + b / 转股平价`，采用原 Python 的 Huber 稳健回归：平价严格处于 50–130，已披露余额大于 1 亿元。余额公告日严格早于当日，不用今天的余额填历史；缺余额的券排除并报告覆盖。市场估值指标为 `a+b/100`，单位百分点。这是独立市场估值序列，不是第六个交易组合。
 
-面试可以这样讲：**把分散的价格、平价、债底和溢价率整理成历史截面，用五个可解释指标每周构建底部十分位组合；另外用稳健反比例拟合计算百元平价溢价率，跟踪市场估值。实现中特别处理信号与成交的时间隔离、退市券和缺失数据，区分因子研究结果与可交易收益。**
+![百元平价估值](examples/premium_at_100.png)
 
-## 依据和可核验来源
+## 结果文件
 
-- 原始研究依据：东北证券《可转债研究框架：从理论到策略》（2024-08-23），PDF 第 28–29 页反比例估值、第 33 页五类技术策略。原工作表公式及 Python 源码进一步确认了平衡型的相对距离、10% 分位和 Huber 回归。本仓库不再分发原工作簿、券商 PDF 或个人简历。
-- [Tushare 可转债日行情](https://tushare.pro/document/2?doc_id=187)：开收盘、成交量、纯债价值、平价与溢价率。
-- [Tushare 可转债基本信息](https://tushare.pro/document/2?doc_id=185)：含历史退市券的证券主表。
-- [Tushare 转股结果](https://tushare.pro/document/2?doc_id=247)：有公告时间的余额历史。
-- [AKShare 债券接口文档](https://akshare.akfamily.xyz/data/bond/bond.html)：采用当前 `bond_cb_value_analysis_em` 和 `bond_cb_info_em` 接口。
+`results/` 包括 `signals.csv`、`trades.csv`、`nav.csv`、`issues.csv`、`metrics.csv`、`annual_returns.csv`、`curve.csv`、`coverage.csv`、`crosscheck.csv`、`run.json` 和两张图。完整持仓数量在 SQLite `holdings` 表。
 
-本仓库公开程序和方法说明；API 数据库、认证信息和其他仓库的原始数据留在本机。通过重新执行命令复现结果，数据供应商历史修订可能改变数值。
+公开仓库 `examples/` 只保存汇总指标与图表；原始数据库及详细账本保留本机并由 Git 忽略。最初未加风险过滤的结果保存在本地 `baseline_original/`，用于对照。
+
+结果是**扣设定交易摩擦后的价格收益，加已识别赎回，不含常规票息**。停牌估值约定可能低估区间波动；数据供应商会修订历史，无法保证原始发布版本。参数和规则在看过历史后确定，应另做未来样本验证，历史表现不代表预期收益。
+
+## 接口与资料
+
+[Tushare 日行情](https://tushare.pro/document/2?doc_id=187) · [基本信息](https://tushare.pro/document/2?doc_id=185) · [转股余额公告](https://tushare.pro/document/2?doc_id=247) · [股票更名](https://tushare.pro/document/2?doc_id=100) · [AKShare 债券](https://akshare.akfamily.xyz/data/bond/bond.html)
+
+复习 pandas / NumPy 可直接看程序的 `read_sql_query`、`groupby`、带主键验证的 `merge`、布尔筛选、滞后价格 `shift`、`np.isfinite` 和累计最高值 `np.maximum.accumulate`。重点是日期对齐、公告可见性、缺失值语义和现金守恒。
