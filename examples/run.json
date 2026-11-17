@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-17T21:36:36.897504+08:00",
+  "generated_at": "2026-11-17T14:36:46.451166+00:00",
   "start": "20190101",
   "end": "20261116",
   "frequency": "weekly",
@@ -40,78 +40,78 @@
   "sources": [
     {
       "source": "akshare.bond_cb_info_em",
-      "cache_entries": 39,
-      "last_fetched_at": "2026-11-17T18:33:20.506958+08:00"
+      "cache_entries": 13,
+      "last_fetched_at": "2026-11-17T14:36:28.082316+00:00"
     },
     {
       "source": "akshare.bond_cb_value_analysis_em",
       "cache_entries": 1,
-      "last_fetched_at": "2026-11-17T17:17:08.615879+08:00"
+      "last_fetched_at": "2026-11-17T14:36:44.293911+00:00"
     },
     {
       "source": "cninfo.announcements",
-      "cache_entries": 63,
-      "last_fetched_at": "2026-11-17T21:34:50.692702+08:00"
+      "cache_entries": 54,
+      "last_fetched_at": "2026-11-17T14:19:18.167033+00:00"
     },
     {
       "source": "cninfo.issuer_coupons",
-      "cache_entries": 161,
-      "last_fetched_at": "2026-11-17T21:22:56.640869+08:00"
+      "cache_entries": 154,
+      "last_fetched_at": "2026-11-17T14:34:06.537052+00:00"
     },
     {
       "source": "cninfo.issuers",
       "cache_entries": 1,
-      "last_fetched_at": "2026-11-17T21:12:47.739067+08:00"
+      "last_fetched_at": "2026-11-17T14:28:26.923496+00:00"
     },
     {
       "source": "cninfo.pdf_text",
-      "cache_entries": 2656,
-      "last_fetched_at": "2026-11-17T21:34:55.066154+08:00"
+      "cache_entries": 2638,
+      "last_fetched_at": "2026-11-17T14:34:08.217973+00:00"
     },
     {
       "source": "eastmoney.redemptions",
       "cache_entries": 1,
-      "last_fetched_at": "2026-11-17T20:30:17.569985+08:00"
+      "last_fetched_at": "2026-11-17T14:34:11.985918+00:00"
     },
     {
       "source": "tushare.cb_basic",
-      "cache_entries": 4,
-      "last_fetched_at": "2026-11-17T20:09:53.136157+08:00"
+      "cache_entries": 3,
+      "last_fetched_at": "2026-11-17T14:34:15.914702+00:00"
     },
     {
       "source": "tushare.cb_call",
       "cache_entries": 2,
-      "last_fetched_at": "2026-11-17T20:30:34.811469+08:00"
+      "last_fetched_at": "2026-11-17T14:34:14.333679+00:00"
     },
     {
       "source": "tushare.cb_daily",
-      "cache_entries": 493,
-      "last_fetched_at": "2026-11-17T17:21:37.881745+08:00"
+      "cache_entries": 424,
+      "last_fetched_at": "2026-11-17T14:04:33.434146+00:00"
     },
     {
       "source": "tushare.cb_share",
       "cache_entries": 55,
-      "last_fetched_at": "2026-11-17T17:13:36.796779+08:00"
+      "last_fetched_at": "2026-11-17T14:05:39.896246+00:00"
     },
     {
       "source": "tushare.index_daily",
       "cache_entries": 8,
-      "last_fetched_at": "2026-11-17T19:30:54.284418+08:00"
+      "last_fetched_at": "2026-11-17T14:05:46.493352+00:00"
     },
     {
       "source": "tushare.namechange",
       "cache_entries": 8,
-      "last_fetched_at": "2026-11-17T18:37:28.785064+08:00"
+      "last_fetched_at": "2026-11-17T14:34:24.644699+00:00"
     },
     {
       "source": "tushare.suspend_d",
-      "cache_entries": 145,
-      "last_fetched_at": "2026-11-17T18:39:23.860740+08:00"
+      "cache_entries": 40,
+      "last_fetched_at": "2026-11-17T14:36:22.116394+00:00"
     },
     {
       "source": "tushare.trade_cal",
-      "cache_entries": 5,
-      "last_fetched_at": "2026-11-17T19:33:06.047400+08:00"
+      "cache_entries": 3,
+      "last_fetched_at": "2026-11-17T13:52:59.502748+00:00"
     }
   ],
   "corporate_actions": {
