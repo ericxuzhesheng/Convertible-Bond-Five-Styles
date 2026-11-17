@@ -1,0 +1,6 @@
+﻿style,start,end,sessions,valid,valid_through,first_unresolved_date,total_return,annual_return,annual_volatility,max_drawdown
+balanced,20190102,20261116,1908,False,20240129,20240130,,,,
+bond,20190102,20261116,1908,False,20230728,20230731,,,,
+double_low,20190102,20261116,1908,False,20230728,20230731,,,,
+equity,20190102,20261116,1908,False,20230728,20230731,,,,
+low_price,20190102,20261116,1908,False,20230728,20230731,,,,

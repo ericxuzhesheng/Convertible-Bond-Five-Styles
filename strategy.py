@@ -43,7 +43,16 @@ def cached(db, source, params, fetch, offline=False):
     if offline:
         raise ValueError(f"Offline cache missing: {key}")
     # API/auth/schema errors propagate. Only a complete response enters the cache.
-    frame = fetch(**params)
+    from requests.exceptions import ConnectionError, Timeout, ChunkedEncodingError
+    for attempt in range(3):
+        try:
+            frame = fetch(**params)
+            break
+        except (ConnectionError, Timeout, ChunkedEncodingError):
+            if attempt == 2:
+                raise
+            print(f"Transport interrupted: {source}; retry {attempt + 1}/2", flush=True)
+            time.sleep(2 ** attempt)
     if not isinstance(frame, pd.DataFrame):
         raise TypeError(f"{source}: expected DataFrame")
     payload = {"columns": frame.columns.tolist(), "rows": json.loads(frame.to_json(orient="records", date_format="iso"))}
@@ -113,6 +122,23 @@ def sync(db, start, end, offline=False, reuse_repo=None):
         bars.append(frame)
         print(f"Daily {left}..{right}: {len(frame):,} rows", flush=True)
     bars = pd.concat(bars, ignore_index=True)
+    if reuse_repo:
+        daily_dir = Path(reuse_repo) / "backtest/strategy_inputs/daily"
+        keys = bars.groupby("trade_date").ts_code.agg(set).to_dict()
+        repaired = []
+        for file in sorted(daily_dir.glob("*.csv")):
+            date = file.stem
+            if first <= date <= end:
+                observed = set(pd.read_csv(file, usecols=["ts_code"]).ts_code)
+                if observed - keys.get(date, set()):
+                    fresh = paged(db, pro, "cb_daily", {"trade_date": date, "fields": FIELDS}, offline)
+                    if fresh.empty:
+                        raise ValueError(f"Empty daily cross-check repair: {date}")
+                    repaired.append(fresh)
+        if repaired:
+            replacements = pd.concat(repaired, ignore_index=True)
+            bars = pd.concat([bars[~bars.trade_date.isin(replacements.trade_date)], replacements], ignore_index=True)
+            print(f"Cross-repository coverage check refreshed {len(repaired)} daily partitions", flush=True)
     unique(bars, ["ts_code", "trade_date"], "bars")
     numeric = FIELDS.split(",")[2:]
     bars[numeric] = bars[numeric].apply(pd.to_numeric, errors="raise")
@@ -292,6 +318,14 @@ def rebalance(positions, cash, opens, targets, cost):
 
 
 def backtest(db, signals, start, end, cost, offline):
+    verified_file = ROOT / "verified_redemptions.csv"
+    if verified_file.exists():
+        for event in pd.read_csv(verified_file, dtype=str).to_dict("records"):
+            ann, record, pay = [ymd(event[k]) for k in ["ann_date", "record_date", "payment_date"]]
+            price = float(event["price"])
+            if not (ann <= pay and record <= pay and np.isfinite(price) and price > 0):
+                raise ValueError(f"Invalid verified event: {event['ts_code']}")
+            put_redemption(db, (event["ts_code"], ann, record, pay, price), event["source"])
     bars = pd.read_sql_query("SELECT * FROM bars ORDER BY trade_date,ts_code", db)
     by_date = {d: f.set_index("ts_code") for d, f in bars.groupby("trade_date")}
     dates = pd.read_sql_query("SELECT cal_date FROM calendar WHERE cal_date BETWEEN ? AND ? ORDER BY cal_date", db,
@@ -307,6 +341,7 @@ def backtest(db, signals, start, end, cost, offline):
             cash += sum(r[1] for r in due)
             receivables = [r for r in receivables if r[0] > date]
             fees = 0.
+            pending_codes = set()
             for code in list(positions):
                 traded = code in day.index and pd.notna(day.at[code, "open"]) and day.at[code, "open"] > 0 and day.at[code, "vol"] > 0
                 if not traded:
@@ -323,9 +358,14 @@ def backtest(db, signals, start, end, cost, offline):
                         continue
                     mark_present = code in day.index and pd.notna(day.at[code, "close"]) and day.at[code, "close"] > 0
                     if not mark_present:
-                        # Retain a visible indicative mark, but withhold performance metrics from this date onward.
-                        tainted = True
-                        issue_rows.append((date, style, code, "missing_quote_unresolved"))
+                        # Announced redemption creates a known non-trading interval before registration.
+                        pending = event and event[0] < date <= event[1] and (pd.Timestamp(event[1])-pd.Timestamp(date)).days <= 10
+                        if pending:
+                            pending_codes.add(code)
+                            issue_rows.append((date, style, code, "redemption_pending_stale_mark"))
+                        else:
+                            tainted = True
+                            issue_rows.append((date, style, code, "missing_quote_unresolved"))
                     else:
                         issue_rows.append((date, style, code, "nontrading_provider_mark"))
             tradable = day[(day.open > 0) & (day.vol > 0) & day.open.notna()]
@@ -344,8 +384,9 @@ def backtest(db, signals, start, end, cost, offline):
                 if code in day.index and pd.notna(day.at[code, "close"]) and day.at[code, "close"] > 0:
                     marks[code] = day.at[code, "close"]
                 else:
-                    tainted = True
-                    issue_rows.append((date, style, code, "missing_close_unresolved"))
+                    if code not in pending_codes:
+                        tainted = True
+                        issue_rows.append((date, style, code, "missing_close_unresolved"))
                 holding_rows.append((date, style, code, quantity, marks[code], quantity * marks[code]))
             value = cash + sum(receipt[1] for receipt in receivables) + sum(q * marks[c] for c, q in positions.items())
             if value <= 0 or not np.isfinite(value):
@@ -400,7 +441,10 @@ def export(db, out, args):
         returns = np.diff(np.r_[1., values]) / np.r_[1., values[:-1]]
         drawdown = values / np.maximum.accumulate(np.r_[1., values])[1:] - 1
         valid = bool(frame.valid.all())
-        row = {"style": style, "start": frame.trade_date.iloc[0], "end": frame.trade_date.iloc[-1], "sessions": len(frame), "valid": valid}
+        known = frame[frame.valid == 1]
+        row = {"style": style, "start": frame.trade_date.iloc[0], "end": frame.trade_date.iloc[-1], "sessions": len(frame), "valid": valid,
+               "valid_through": known.trade_date.iloc[-1] if not known.empty else None,
+               "first_unresolved_date": frame.loc[frame.valid == 0, "trade_date"].iloc[0] if not valid else None}
         row.update(total_return=values[-1] - 1 if valid else None,
                    annual_return=values[-1] ** (252 / len(frame)) - 1 if valid else None,
                    annual_volatility=np.std(returns, ddof=1) * np.sqrt(252) if valid and len(frame) > 1 else None,
@@ -418,6 +462,12 @@ def export(db, out, args):
     for axis in axes:
         axis.grid(alpha=.25)
     fig.tight_layout(); fig.savefig(out / "weekly_styles.png", dpi=160); plt.close(fig)
+    curve = pd.read_sql_query("SELECT * FROM curve ORDER BY trade_date", db)
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(pd.to_datetime(curve.trade_date), curve.premium_at_100)
+    ax.set(title="Market conversion premium at parity 100 | Huber fit", ylabel="Premium (percentage points)")
+    ax.grid(alpha=.25)
+    fig.tight_layout(); fig.savefig(out / "premium_at_100.png", dpi=160); plt.close(fig)
     pd.DataFrame(metrics).to_csv(out / "metrics.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(annual).to_csv(out / "annual_returns.csv", index=False, encoding="utf-8-sig")
     coverage = pd.read_sql_query("""SELECT substr(trade_date,1,4) AS year,COUNT(DISTINCT trade_date) AS sessions,

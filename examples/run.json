@@ -1,0 +1,48 @@
+{
+  "generated_at": "2026-11-17T17:27:28.526658+08:00",
+  "start": "20190101",
+  "end": "20261116",
+  "frequency": "weekly",
+  "signal": "prior session close",
+  "execution": "next week first session open",
+  "one_way_cost_bps": 5.0,
+  "fraction": 0.1,
+  "limitations": [
+    "Regular coupons excluded; not total return",
+    "Daily data cannot guarantee open auction fills or capacity",
+    "Provider history can be revised; no original-release vintage guarantee",
+    "Unresolved held marks invalidate subsequent performance; inspect issues.csv"
+  ],
+  "sources": [
+    {
+      "source": "akshare.bond_cb_info_em",
+      "cache_entries": 37,
+      "last_fetched_at": "2026-11-17T17:17:05.857309+08:00"
+    },
+    {
+      "source": "akshare.bond_cb_value_analysis_em",
+      "cache_entries": 1,
+      "last_fetched_at": "2026-11-17T17:17:08.615879+08:00"
+    },
+    {
+      "source": "tushare.cb_basic",
+      "cache_entries": 2,
+      "last_fetched_at": "2026-11-17T17:00:47.482708+08:00"
+    },
+    {
+      "source": "tushare.cb_daily",
+      "cache_entries": 493,
+      "last_fetched_at": "2026-11-17T17:21:37.881745+08:00"
+    },
+    {
+      "source": "tushare.cb_share",
+      "cache_entries": 55,
+      "last_fetched_at": "2026-11-17T17:13:36.796779+08:00"
+    },
+    {
+      "source": "tushare.trade_cal",
+      "cache_entries": 4,
+      "last_fetched_at": "2026-11-17T17:00:49.611323+08:00"
+    }
+  ]
+}
