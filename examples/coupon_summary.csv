@@ -1,0 +1,16 @@
+﻿style,event,events,amount
+balanced,coupon_payment,224,0.0579854648688671
+balanced,coupon_receivable,224,0.0579854648688671
+balanced,entitlement_locked,224,0.0579854648688671
+bond,coupon_payment,257,0.10592884398785088
+bond,coupon_receivable,257,0.10592884398785088
+bond,entitlement_locked,257,0.10592884398785088
+double_low,coupon_payment,212,0.1547663439858216
+double_low,coupon_receivable,212,0.1547663439858216
+double_low,entitlement_locked,212,0.1547663439858216
+equity,coupon_payment,229,0.16224090811111738
+equity,coupon_receivable,229,0.16224090811111738
+equity,entitlement_locked,229,0.16224090811111738
+low_price,coupon_payment,253,0.07736215623544591
+low_price,coupon_receivable,253,0.07736215623544591
+low_price,entitlement_locked,253,0.07736215623544591

@@ -4,12 +4,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import io
+import unicodedata
 from pathlib import Path
 import sqlite3
 import sys
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -18,6 +23,396 @@ ROOT = Path(__file__).resolve().parent
 STYLES = {"equity": "偏股型", "bond": "偏债型", "low_price": "低价",
           "double_low": "双低", "balanced": "平衡型"}
 FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount,bond_value,bond_over_rate,cb_value,cb_over_rate"
+ANNOUNCEMENT_URL = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+
+
+def fetch_notices(query, start, end, stock="", category="category_kzzq_szsh"):
+    import requests
+    records, expected = [], None
+    for page in range(1, 2001):
+        response = requests.post(ANNOUNCEMENT_URL, data={"pageNum": page, "pageSize": 30,
+            "column": "szse", "tabName": "fulltext", "plate": "", "stock": stock, "searchkey": query,
+            "secid": "", "category": category, "trade": "",
+            "seDate": f"{pd.Timestamp(start):%Y-%m-%d}~{pd.Timestamp(end):%Y-%m-%d}",
+            "sortName": "", "sortType": "", "isHLtitle": "false"}, timeout=40)
+        response.raise_for_status()
+        data = response.json()
+        if "totalAnnouncement" not in data:
+            raise ValueError("CNInfo did not return an announcement count")
+        if expected is None:
+            expected = int(data["totalAnnouncement"])
+        if expected != int(data["totalAnnouncement"]):
+            raise ValueError("CNInfo result changed during pagination; retry the interval")
+        part = data.get("announcements") or []
+        if not part and len(records) < expected:
+            raise ValueError("CNInfo pagination ended before the advertised count")
+        records.extend(part)
+        if len(records) >= expected:
+            break
+        time.sleep(.15)
+    else:
+        raise ValueError("CNInfo page limit exceeded")
+    columns = ["announcementId", "secCode", "announcementTitle", "announcementTime", "adjunctUrl"]
+    frame = pd.DataFrame(records, columns=columns)
+    unique(frame, ["announcementId"], "announcement pages")
+    if len(frame) != expected:
+        raise ValueError("CNInfo announcement count mismatch")
+    return frame
+
+
+def fetch_issuers(snapshot):
+    import requests
+    response = requests.get("https://www.cninfo.com.cn/new/data/szse_stock.json", timeout=40)
+    response.raise_for_status()
+    frame = pd.DataFrame(response.json()["stockList"])[["code", "orgId"]]
+    unique(frame, ["code"], "CNInfo issuer directory")
+    return frame
+
+
+def missing_coupon_issuers(basic, coupons, start, end, market_codes):
+    groups = {code: pd.to_datetime(group.ex_date) for code, group in coupons.groupby("ts_code")}
+    missing = set()
+    for b in basic[basic.ts_code.isin(market_codes)].to_dict("records"):
+        if not b["value_date"] or not b["maturity_date"]:
+            raise ValueError("Missing coupon contract dates")
+        for year in range(1, 20):
+            date = pd.Timestamp(b["value_date"]) + pd.DateOffset(years=year)
+            if date >= pd.Timestamp(b["maturity_date"]) or ymd(date) > end:
+                break
+            if ymd(date) < start or (b["delist_date"] and ymd(date) >= b["delist_date"]) or b["list_date"] > ymd(date):
+                continue
+            observed = groups.get(b["ts_code"], pd.Series([], dtype="datetime64[ns]"))
+            if not (observed-date).dt.days.abs().le(15).any():
+                missing.add(b["stk_code"][:6])
+    return sorted(missing)
+
+
+def fetch_notice_text(url):
+    import requests
+    from pypdf import PdfReader
+    response = requests.get(url, timeout=40)
+    response.raise_for_status()
+    if not response.content.startswith(b"%PDF"):
+        raise ValueError(f"Announcement is not a PDF: {url}")
+    pages = []
+    for number, page in enumerate(PdfReader(io.BytesIO(response.content)).pages, 1):
+        lines = (page.extract_text() or "").strip().splitlines()
+        if lines and lines[0].strip() == str(number):
+            lines.pop(0)
+        if lines and lines[-1].strip() == str(number):
+            lines.pop()
+        pages.append("\n".join(lines))
+    text = "\n\f\n".join(pages)
+    if len(text.strip()) < 100:
+        raise ValueError(f"Announcement has no usable text: {url}")
+    return pd.DataFrame([{"text": text}])
+
+
+def prefetch_coupon_texts(db, index, offline):
+    urls = sorted(set(index.loc[index.announcementTitle.str.contains("付息|兑付利息") &
+                               index.announcementTitle.str.contains("转债|可转换|转0?[2-9]"), "source"]))
+    existing = {json.loads(key.split(":", 1)[1])["url"] for key, in db.execute("SELECT key FROM cache WHERE source='cninfo.pdf_text'")}
+    missing = [url for url in urls if url not in existing]
+    if offline and missing:
+        raise ValueError(f"Offline announcement text cache missing {len(missing)} PDFs")
+    def download(url):
+        from requests.exceptions import ConnectionError, Timeout, ChunkedEncodingError
+        for attempt in range(3):
+            try:
+                return fetch_notice_text(url)
+            except (ConnectionError, Timeout, ChunkedEncodingError):
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(download, url): url for url in missing}
+        for n, future in enumerate(as_completed(futures), 1):
+            frame = future.result()
+            cached(db, "cninfo.pdf_text", {"url": futures[future]}, lambda **kw: frame)
+            if n % 100 == 0:
+                print(f"Coupon PDF cache: {n}/{len(missing)}", flush=True)
+
+
+def notice_codes(text, codes):
+    found = re.findall(r"(?<!\d)\d{6}(?!\d)", text)
+    found += re.findall(r"代码[:：]?(\d{6})", text)
+    return sorted(set(found) & set(codes))
+
+
+def parse_coupon(notice, text, codes, bond_names=None):
+    text = re.sub(r"(?m)^[ \t]+\d{1,2}[ \t]+$", "", text)
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    found = notice_codes(text, codes)
+    specific = set(re.findall(r"(?:可转债|可转换(?:公司)?债券)(?:的)?代码[:：]?(\d{6})", text)) & set(codes)
+    section_codes = set(re.findall(r"本期债券(?:的)?基本情况.{0,200}?代码[:：]?(\d{6})", text)) & set(codes)
+    if len(section_codes) == 1:
+        specific = section_codes
+    if len(specific) == 1:
+        found = sorted(specific)
+    if len(found) > 1 and bond_names:
+        named = [c for c in found if bond_names.get(c, "\0") in notice["announcementTitle"]]
+        if not named:
+            named = [c for c in found if re.search(re.escape(bond_names.get(c,"\0")) + r"[”\"]?(?:\([^)]*\))?(?:将于|本次付息)", text)]
+        if len(named) == 1:
+            found = named
+    if len(found) != 1:
+        raise ValueError(f"Expected one bond code, found {found}")
+    amendment = bool(re.search("更正|调整|补充", notice["announcementTitle"]))
+    if amendment:
+        text = re.split("更正后[:：]|更新后[:：]|调整后[:：]", text)[-1]
+    date_pattern = r"(20\d{2})年(\d{1,2})月(\d{1,2})日"
+    ann = notice["ann_date"]
+    def dates_for(label):
+        cleaned = re.sub(r"原(?:定)?(?:付息日|除息日)20\d{2}年\d{1,2}月\d{1,2}日", "", text)
+        changes = re.findall(r"(?:" + label + r")[为是:：、,]{0,4}由20\d{2}年\d{1,2}月\d{1,2}日(?:调整|变更)为" + date_pattern, text)
+        matches = changes or re.findall(r"(?:" + label + r")[为是:：、,]{0,4}" + date_pattern, cleaned)
+        dates = {f"{int(y):04}{int(m):02}{int(d):02}" for y,m,d in matches}
+        return sorted(d for d in dates if ymd(pd.Timestamp(ann)-pd.Timedelta(days=40)) <= d <= ymd(pd.Timestamp(ann)+pd.Timedelta(days=60)))
+    registration = dates_for("债权登记日|债券登记日|利息登记日|权益登记日|付息登记日|可转债登记日")
+    payment = dates_for(r"发放日\)?|兑息日|利息支付日|兑息") or dates_for(r"付息日|除权除息\(付息\)日")
+    ex = dates_for(r"除息日|除权除息\(付息\)日")
+    if len(ex) == 1 and len(payment) > 1:
+        payment = [d for d in payment if d >= ex[0]]
+    if len(registration) > 1 or len(payment) > 1 or len(ex) > 1 or (not amendment and (not registration or not payment)):
+        raise ValueError(f"Ambiguous coupon dates: record={registration}, payment={payment}, ex={ex}")
+    amounts = []
+    # Tax examples may contain copied prior-year amounts; use the current gross-payment section.
+    cash_text = re.split("对于持有", text, maxsplit=1)[0]
+    for match in re.finditer(r"([\d,]+(?:\.\d+)?)元(?:人民币)?[()、,，]*(?:含税|税前)", cash_text):
+        before = cash_text[max(0,match.start()-160):match.start()]
+        before = re.sub(r"[（(]每张面值为?100(?:\.0+)?元[,，、]?", "(", before)
+        units = list(re.finditer(r"每(?:(10|十|1|一))?(张|手)|每(?:1000|1,000|千)元|每(?:100|一百)元", before))
+        if not units:
+            continue
+        unit = units[-1]
+        # The surrounding phrase must describe coupon interest, not face value or redemption principal.
+        if not re.search("利息|付息|派发|兑息", before[unit.end():]):
+            continue
+        count = 10 if unit.group(2) == "手" or unit.group(1) in ("10","十") or re.search("1000|1,000|千",unit.group()) else 1
+        amounts.append(float(match.group(1).replace(",", "")) / count)
+    amounts.extend(float(v)/10 for v in re.findall(r"1000元面值债券利息\(含税\)[:：]([\d.]+)元", cash_text))
+    amounts = sorted(set(round(a, 8) for a in amounts))
+    if not amounts:
+        amounts = sorted({float(v) for v in re.findall(
+            r"(?:本期|本次|当期)(?:债券|可转债)?(?:的)?(?:票面)?利率[为:：]*([\d.]+)%", text)})
+    if not amounts and amendment:
+        amounts = [None]  # Resolved only against the earlier original announcement.
+    if len(amounts) != 1 or (amounts[0] is not None and not 0 < amounts[0] < 20):
+        raise ValueError(f"Ambiguous gross interest per CNY100: {amounts}")
+    record, pay = registration[0] if registration else None, payment[0] if payment else None
+    ex_date = ex[0] if ex else pay
+    if not amendment and (not record < ex_date <= pay or ann >= ex_date):
+        raise ValueError("Coupon announcement/record/ex/payment dates are inconsistent")
+    return {"ts_code": codes[found[0]], "ann_date": ann, "record_date": record,
+            "ex_date": ex_date, "payment_date": pay, "gross_per_bond": amounts[0],
+            "announcement_id": str(notice["announcementId"]), "source": notice["source"]}
+
+
+def fetch_redemption_snapshot(snapshot):
+    import requests
+    rows, expected = [], None
+    for page in range(1, 101):
+        response = requests.get("https://datacenter-web.eastmoney.com/api/data/v1/get", params={
+            "reportName": "RPT_BOND_CB_LIST", "columns": "SECURITY_CODE,SECUCODE,NOTICE_DATE_SH,RECORD_DATE_SH,EXECUTE_PRICE_SH,EXECUTE_START_DATESH,REDEEM_TYPE",
+            "pageSize": 500, "pageNumber": page, "source": "WEB", "client": "WEB"}, timeout=40)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success") or not payload.get("result"):
+            raise ValueError("Eastmoney corporate-action snapshot failed")
+        result = payload["result"]
+        if expected is None:
+            expected = int(result["count"])
+        if int(result["count"]) != expected:
+            raise ValueError("Eastmoney snapshot changed during pagination")
+        rows.extend(result["data"])
+        if page >= int(result["pages"]):
+            break
+    frame = pd.DataFrame(rows)
+    unique(frame, ["SECUCODE"], "redemption snapshot")
+    if len(frame) != expected:
+        raise ValueError("Incomplete redemption snapshot")
+    return frame
+
+
+def normalize_coupons(rows):
+    # A corrected notice replaces the earlier notice for the same annual payment.
+    # The original notice is retained in announcement_index and the request cache.
+    normalized = []
+    for row in sorted(rows, key=lambda r: (r["ts_code"], r["ann_date"], r["announcement_id"])):
+        anchor = row["ex_date"] or row["payment_date"] or row["record_date"] or row["ann_date"]
+        previous = [r for r in normalized if r["ts_code"] == row["ts_code"] and
+                    abs((pd.Timestamp(r["ex_date"]) - pd.Timestamp(anchor)).days) < 60]
+        if previous:
+            if len(previous) != 1:
+                raise ValueError("Multiple original coupon notices for one correction")
+            old = previous[0]
+            fields = ["record_date", "ex_date", "payment_date", "gross_per_bond"]
+            row = {**row, **{field: old[field] for field in fields if row[field] is None},
+                   "source": old["source"] + " | " + row["source"]}
+            if any(row[f] != old[f] for f in fields):
+                if row["ann_date"] >= min(row["ex_date"], old["ex_date"]):
+                    raise ValueError("Coupon revision discovered after ex-date requires explicit reconciliation")
+                normalized.remove(old)
+            else:
+                continue
+        if any(row[f] is None for f in ["record_date", "ex_date", "payment_date", "gross_per_bond"]):
+            raise ValueError("Coupon correction lacks an original amount or date")
+        if not row["record_date"] < row["ex_date"] <= row["payment_date"]:
+            raise ValueError("Corrected coupon dates are inconsistent")
+        normalized.append(row)
+    frame = pd.DataFrame(normalized)
+    unique(frame, ["ts_code", "ex_date"], "coupon cash flows")
+    return frame
+
+
+def risk_notice_type(title):
+    # The exchange category also contains exchangeable bonds, offshore bonds and cash management notices.
+    if re.search("可交换|优先股|现金管理|理财|美元|港币|法律意见|核查意见|受托管理|担保|持有人会议", title):
+        return None
+    if not re.search("转债|可转换|转0?[2-9]|股票.*终止上市", title):
+        return None
+    if re.search("不提前|不行使|不赎回|暂不|未提前|取消.*赎回|撤销.*赎回", title):
+        return ("redemption", 0)
+    if re.search("预计|可能|满足|触发", title):
+        return None
+    if re.search("停止交易|终止上市|摘牌", title):
+        return ("trading_termination", 1)
+    if "赎回" in title:
+        return ("redemption", 1)
+    return None
+
+
+def sync_corporate_actions(db, start, end, offline=False):
+    import tushare as ts
+    pro = None if offline else ts.pro_api(os.environ["TUSHARE_TOKEN"], timeout=40)
+    basic = paged(db, pro, "cb_basic", {"_snapshot": end,
+        "fields": "ts_code,stk_code,bond_short_name,value_date,maturity_date,rate_clause,pay_per_year,delist_date,list_date"}, offline).fillna("")
+    unique(basic, ["ts_code"], "coupon bond master")
+    basic.to_sql("coupon_bonds", db, if_exists="replace", index=False)
+    market_codes = set(pd.read_sql_query("SELECT DISTINCT ts_code FROM bars", db).ts_code)
+    codes = {c[:6]: c for c in basic.ts_code}
+    names = dict(zip(basic.ts_code.str[:6], basic.bond_short_name))
+    parts, coverage = [], []
+    for query in ["付息", "兑付利息", "赎回", "停止交易", "终止上市", "摘牌"]:
+        for year in range(int(start[:4])-1, int(end[:4])+1):
+            left, right = f"{year}0101", min(f"{year}1231", end)
+            params = {"query": query, "start": left, "end": right}
+            if query == "兑付利息":
+                params["category"] = ""  # These historical notices are often outside the CB category.
+            frame = cached(db, "cninfo.announcements", params, fetch_notices, offline)
+            parts.append(frame)
+            coverage.append({"source": "cninfo", "query": query, "start": left, "end": right, "rows": len(frame)})
+    index = pd.concat(parts, ignore_index=True).drop_duplicates("announcementId")
+    index["ann_date"] = pd.to_datetime(index.announcementTime, unit="ms", utc=True).dt.tz_convert("Asia/Shanghai").dt.strftime("%Y%m%d")
+    index["source"] = "https://static.cninfo.com.cn/" + index.adjunctUrl
+    index.to_sql("announcement_index", db, if_exists="replace", index=False)
+    coverage = pd.DataFrame(coverage)
+    coverage.to_sql("announcement_coverage", db, if_exists="replace", index=False)
+    prefetch_coupon_texts(db, index, offline)
+    coupons, events, reviews = [], [], []
+    def text_of(row):
+        return cached(db, "cninfo.pdf_text", {"url": row["source"]}, fetch_notice_text, offline).text.iloc[0]
+    def add_coupon(n):
+        title = n["announcementTitle"]
+        if not re.search("转债|可转换|转0?[2-9]", title):
+            reviews.append((n["announcementId"], "not_a_convertible_coupon", title, n["source"]))
+            return
+        text = text_of(n)
+        observed = notice_codes(re.sub(r"\s+", "", text), codes)
+        if "资金到位" in title:
+            reviews.append((n["announcementId"], "funding_update_not_payment_schedule", title, n["source"]))
+            return
+        if not any(codes[c] in market_codes for c in observed):
+            reviews.append((n["announcementId"], "outside_traded_universe", title, n["source"]))
+            return
+        try:
+            coupons.append(parse_coupon(n, text, codes, names))
+        except ValueError as exc:
+            raise ValueError(f"Coupon notice {n['announcementId']} ({title}): {exc}") from exc
+    for n in index.sort_values(["ann_date", "announcementId"]).to_dict("records"):
+        title = n["announcementTitle"]
+        issuer = basic[basic.stk_code.str[:6].eq(str(n["secCode"]).zfill(6))]
+        issuer = issuer[issuer.ts_code.isin(market_codes)]
+        if re.search("付息|兑付利息", title):
+            add_coupon(n)
+        kind = risk_notice_type(title)
+        if kind is None:
+            continue
+        named = issuer[issuer.bond_short_name.map(lambda name: bool(name) and name in title)]
+        choices = named if len(named) == 1 else issuer[(issuer.value_date < n["ann_date"]) &
+            ((issuer.delist_date == "") | (issuer.delist_date >= ymd(pd.Timestamp(n["ann_date"])-pd.Timedelta(days=60))))]
+        choices = choices[choices.ts_code.isin(market_codes)]
+        if len(choices) != 1:
+            observed = notice_codes(re.sub(r"\s+", "", text_of(n)), codes)
+            actual = [codes[c] for c in observed if codes[c] in market_codes]
+            if not actual:
+                reviews.append((n["announcementId"], "outside_traded_universe", title, n["source"]))
+                continue
+            if len(actual) != 1:
+                raise ValueError(f"Ambiguous risk-announcement bond: {n['announcementId']} {actual}")
+            code = actual[0]
+        else:
+            code = choices.ts_code.iloc[0]
+        events.append({"ts_code": code, "ann_date": n["ann_date"], "effective_date": n["ann_date"],
+                       "risk_type": kind[0], "blocked": kind[1], "source": n["source"]})
+    coupon_frame = normalize_coupons(coupons)
+    missing_issuers = missing_coupon_issuers(basic, coupon_frame, start, end, market_codes)
+    if missing_issuers:
+        directory = cached(db, "cninfo.issuers", {"snapshot": end}, fetch_issuers, offline).set_index("code").orgId
+        supplements = []
+        existing_ids = set(index.announcementId.astype(str))
+        for issuer_code in missing_issuers:
+            if issuer_code not in directory.index:
+                raise ValueError(f"Cannot resolve CNInfo organization for coupon search: {issuer_code}")
+            left = f"{int(start[:4])-1}0101"
+            extra = cached(db, "cninfo.issuer_coupons", {"query": "付息", "start": left, "end": end,
+                "stock": issuer_code + "," + directory.loc[issuer_code], "category": ""}, fetch_notices, offline)
+            if not extra.empty and not extra.secCode.astype(str).eq(issuer_code).all():
+                raise ValueError("CNInfo issuer filter did not restrict the announcement results")
+            extra["ann_date"] = pd.to_datetime(extra.announcementTime, unit="ms", utc=True).dt.tz_convert("Asia/Shanghai").dt.strftime("%Y%m%d")
+            extra["source"] = "https://static.cninfo.com.cn/" + extra.adjunctUrl
+            supplements.append(extra)
+            coverage.loc[len(coverage)] = ["cninfo_issuer:" + issuer_code, "付息 (all categories)", left, end, len(extra)]
+            for n in extra[~extra.announcementId.astype(str).isin(existing_ids)].to_dict("records"):
+                add_coupon(n)
+                existing_ids.add(str(n["announcementId"]))
+            print(f"Coupon issuer coverage repair {issuer_code}: {len(extra)} notices", flush=True)
+        index = pd.concat([index, *supplements], ignore_index=True).drop_duplicates("announcementId")
+        index.to_sql("announcement_index", db, if_exists="replace", index=False)
+        coupon_frame = normalize_coupons(coupons)
+    coupon_frame.to_sql("coupons", db, if_exists="replace", index=False)
+    coverage.to_sql("announcement_coverage", db, if_exists="replace", index=False)
+    snapshot = cached(db, "eastmoney.redemptions", {"snapshot": end}, fetch_redemption_snapshot, offline)
+    for row in snapshot.to_dict("records"):
+        if str(row["REDEEM_TYPE"]).removesuffix(".0") != "2":
+            continue
+        event = parse_redemption(row)
+        if event and event[1] <= end:
+            put_redemption(db, event, "https://data.eastmoney.com/kzz/detail/" + row["SECUCODE"][:6] + ".html")
+    # Query the full paginated snapshot: date-filtered cb_call requests can return empty
+    # even when the unfiltered endpoint contains the requested announcement dates.
+    calls = paged(db, pro, "cb_call", {"_snapshot": end,
+        "fields": "ts_code,call_type,is_call,ann_date,call_date,call_price,payment_date,call_reg_date"}, offline)
+    if calls.empty:
+        raise ValueError("The complete cb_call snapshot is empty")
+    calls = calls[calls.ann_date.notna() & (calls.ann_date <= end)].sort_values("ann_date", kind="stable")
+    calls.to_sql("call_announcements", db, if_exists="replace", index=False)
+    statuses = {"公告实施强赎": 1, "公告强赎": 1, "公告到期赎回": 1, "公告不强赎": 0}
+    for call in calls.to_dict("records"):
+        if call["ts_code"] not in market_codes or call["is_call"] not in statuses:
+            continue
+        events.append({"ts_code": call["ts_code"], "ann_date": call["ann_date"], "effective_date": call["ann_date"],
+                       "risk_type": "redemption", "blocked": statuses[call["is_call"]], "source": "https://tushare.pro/document/2?doc_id=269"})
+        needed = ["call_reg_date", "payment_date", "call_price"]
+        if statuses[call["is_call"]] and all(pd.notna(call[k]) for k in needed):
+            record, pay, price = str(call["call_reg_date"]), str(call["payment_date"]), float(call["call_price"])
+            if call["ann_date"] <= pay and record <= pay and np.isfinite(price) and price > 0:
+                put_redemption(db, (call["ts_code"], call["ann_date"], record, pay, price), "Tushare cb_call")
+    pd.DataFrame(events).drop_duplicates().to_sql("announcement_risks", db, if_exists="replace", index=False)
+    pd.DataFrame(reviews, columns=["announcement_id", "status", "title", "source"]).to_sql("announcement_reviews", db, if_exists="replace", index=False)
+    pd.DataFrame([{"start": start, "end": end, "notices": len(index), "coupons": len(coupon_frame),
+                   "risk_events": len(events), "status": "complete"}]).to_sql("corporate_action_state", db, if_exists="replace", index=False)
+    print(f"Corporate actions: {len(index)} notices, {len(coupon_frame)} coupons, {len(events)} risk events", flush=True)
 
 
 def ymd(value):
@@ -58,7 +453,8 @@ def cached(db, source, params, fetch, offline=False):
     payload = {"columns": frame.columns.tolist(), "rows": json.loads(frame.to_json(orient="records", date_format="iso"))}
     with db:
         db.execute("INSERT INTO cache VALUES (?,?,?,?)", (key, source, datetime.now().astimezone().isoformat(), json.dumps(payload)))
-    time.sleep(0.35)
+    if source.startswith("tushare."):
+        time.sleep(0.35)
     return frame
 
 
@@ -304,7 +700,10 @@ def prepare_risk(db, end, offline):
     names["risk_type"] = "stock_name"
     names["blocked"] = names.name.str.contains("ST|退", case=False, regex=True).astype(int)
     events = pd.read_csv(ROOT / "risk_events.csv", dtype={"ann_date": str, "effective_date": str})
-    events = pd.concat([events[events.risk_type != "stock_name"], names], ignore_index=True)
+    # Keep the two sourced manual exceptions; live announcement history replaces stale vendor snapshots.
+    manual = events[(events.risk_type != "stock_name") & ~events.source.str.contains("data.eastmoney.com", regex=False)]
+    notices = pd.read_sql_query("SELECT * FROM announcement_risks", db)
+    events = pd.concat([manual, names, notices], ignore_index=True)
     events["available"] = events.apply(lambda r: risk_available(r.ann_date, r.effective_date), axis=1)
     events = events.sort_values(["available", "ann_date", "effective_date"], kind="stable")
     dates = pd.read_sql_query("SELECT cal_date FROM calendar ORDER BY cal_date", db).cal_date
@@ -452,7 +851,7 @@ def rebalance(positions, cash, opens, targets, cost):
     return {**frozen, **target}, max(0., cash_after), fees, trades
 
 
-def backtest(db, signals, start, end, cost, offline, risk_blocks=None):
+def backtest(db, signals, start, end, cost, offline, risk_blocks=None, coupon_events=None):
     verified_file = ROOT / "verified_redemptions.csv"
     if verified_file.exists():
         for event in pd.read_csv(verified_file, dtype=str).to_dict("records"):
@@ -468,12 +867,20 @@ def backtest(db, signals, start, end, cost, offline, risk_blocks=None):
     price_risk = {d: set(f.ts_code) for d, f in price_risk[price_risk.previous_close < 90].groupby("trade_date")}
     dates = pd.read_sql_query("SELECT cal_date FROM calendar WHERE cal_date BETWEEN ? AND ? ORDER BY cal_date", db,
                               params=(start, end)).cal_date
+    coupons_by_record = {} if coupon_events is None else {d: f.to_dict("records") for d,f in coupon_events.groupby("record_date")}
     nav_rows, trade_rows, issue_rows, holding_rows = [], [], [], []
+    coupon_rows = []
     for style in STYLES:
         positions, marks, cash, receivables = {}, {}, 1., []
+        coupon_claims = []
         tainted = False
         for date in dates:
             day = by_date[date]
+            for claim in coupon_claims:
+                if claim["ex_date"] <= date and not claim["recognized"]:
+                    claim["recognized"] = True
+                    coupon_rows.append((date, style, claim["ts_code"], "coupon_receivable", claim["amount"],
+                        claim["quantity"], claim["gross_per_bond"], claim["record_date"], claim["ex_date"], claim["payment_date"], claim["source"]))
             # Cash becomes available only on the provider's payment date (next market session if closed).
             due = [r for r in receivables if r[0] <= date]
             cash += sum(r[1] for r in due)
@@ -541,19 +948,92 @@ def backtest(db, signals, start, end, cost, offline, risk_blocks=None):
                         tainted = True
                         issue_rows.append((date, style, code, "missing_close_unresolved"))
                 holding_rows.append((date, style, code, quantity, marks[code], quantity * marks[code]))
-            value = cash + sum(receipt[1] for receipt in receivables) + sum(q * marks[c] for c, q in positions.items())
+            # Full-price marks already contain accrued interest at registration close.
+            # Lock entitlement now, recognize it on ex-date, credit cash at payment close.
+            for coupon in coupons_by_record.get(date, []):
+                quantity = positions.get(coupon["ts_code"], 0.)
+                if quantity > 0:
+                    event = db.execute("SELECT record_date FROM redemptions WHERE ts_code=?", (coupon["ts_code"],)).fetchone()
+                    if event and event[0] == date:
+                        raise ValueError("Coupon overlaps a principal-and-interest redemption; reconcile before accounting")
+                    claim = {**coupon, "quantity": quantity, "amount": quantity * coupon["gross_per_bond"], "recognized": False}
+                    coupon_claims.append(claim)
+                    coupon_rows.append((date, style, claim["ts_code"], "entitlement_locked", claim["amount"],
+                        quantity, claim["gross_per_bond"], date, claim["ex_date"], claim["payment_date"], claim["source"]))
+            due_coupons = [c for c in coupon_claims if c["payment_date"] <= date]
+            for claim in due_coupons:
+                if not claim["recognized"]:
+                    raise ValueError("Coupon payment precedes recognition")
+                cash += claim["amount"]
+                coupon_rows.append((date, style, claim["ts_code"], "coupon_payment", claim["amount"],
+                    claim["quantity"], claim["gross_per_bond"], claim["record_date"], claim["ex_date"], claim["payment_date"], claim["source"]))
+            coupon_claims = [c for c in coupon_claims if c["payment_date"] > date]
+            coupon_receivable = sum(c["amount"] for c in coupon_claims if c["recognized"])
+            value = cash + sum(receipt[1] for receipt in receivables) + coupon_receivable + sum(q * marks[c] for c, q in positions.items())
             if value <= 0 or not np.isfinite(value):
                 raise ValueError(f"Invalid NAV: {style} {date}")
-            nav_rows.append((date, style, value, cash, fees, len(positions), int(not tainted)))
+            nav_rows.append((date, style, value, cash, fees, len(positions), int(not tainted), coupon_receivable))
         print(f"Backtest {style}: {len(dates)} sessions; valid={not tainted}", flush=True)
     tables = {
-        "nav": pd.DataFrame(nav_rows, columns=["trade_date", "style", "nav", "cash", "fees", "holdings", "valid"]),
+        "nav": pd.DataFrame(nav_rows, columns=["trade_date", "style", "nav", "cash", "fees", "holdings", "valid", "coupon_receivable"]),
         "trades": pd.DataFrame(trade_rows, columns=["trade_date", "style", "ts_code", "quantity_change", "price", "fee", "reason"]),
         "issues": pd.DataFrame(issue_rows, columns=["trade_date", "style", "ts_code", "issue"]).drop_duplicates(),
-        "holdings": pd.DataFrame(holding_rows, columns=["trade_date", "style", "ts_code", "quantity", "mark", "value"])}
+        "holdings": pd.DataFrame(holding_rows, columns=["trade_date", "style", "ts_code", "quantity", "mark", "value"]),
+        "coupon_ledger": pd.DataFrame(coupon_rows, columns=["trade_date", "style", "ts_code", "event", "amount", "quantity", "gross_per_bond", "record_date", "ex_date", "payment_date", "source"])}
     for table, frame in tables.items():
         frame.to_sql(table, db, if_exists="replace", index=False)
     return tables
+
+
+def check_coupon_coverage(db, start, end):
+    basic = pd.read_sql_query("SELECT * FROM coupon_bonds", db)
+    coupons = pd.read_sql_query("SELECT * FROM coupons", db)
+    holdings = pd.read_sql_query("SELECT DISTINCT trade_date,ts_code FROM holdings", db)
+    held = set(map(tuple, holdings.itertuples(index=False, name=None)))
+    held_codes = set(holdings.ts_code)
+    coupons["ex_timestamp"] = pd.to_datetime(coupons.ex_date)
+    coupon_groups = {code: group for code, group in coupons.groupby("ts_code")}
+    calendar = pd.read_sql_query("SELECT cal_date FROM calendar ORDER BY cal_date", db).cal_date.tolist()
+    contracts = basic.set_index("ts_code")
+    for coupon in coupons.to_dict("records"):
+        contract = contracts.loc[coupon["ts_code"]]
+        year = round((pd.Timestamp(coupon["ex_date"])-pd.Timestamp(contract.value_date)).days/365.25)
+        rates = re.findall(r"(\d+(?:\.\d+)?)\s*[%％]", contract.rate_clause)
+        if not 1 <= year <= len(rates) or not np.isclose(float(rates[year-1]), coupon["gross_per_bond"]):
+            raise ValueError(f"Coupon amount disagrees with the bond contract: {coupon['ts_code']} {coupon['ex_date']}")
+        if start <= coupon["record_date"] <= end and coupon["record_date"] not in calendar:
+            raise ValueError(f"Coupon record date is not a trading session: {coupon['ts_code']} {coupon['record_date']}")
+    rows = []
+    for b in basic.to_dict("records"):
+        if b["ts_code"] not in held_codes:
+            continue
+        if not b["value_date"] or not b["maturity_date"] or int(b["pay_per_year"]) != 1:
+            raise ValueError(f"Unsupported coupon contract for held bond {b['ts_code']}")
+        issue, maturity = pd.Timestamp(b["value_date"]), pd.Timestamp(b["maturity_date"])
+        for year in range(1, 20):
+            anniversary = issue + pd.DateOffset(years=year)
+            if anniversary >= maturity or ymd(anniversary) > end:
+                break  # The maturity amount already includes the final coupon.
+            if ymd(anniversary) < start or (b["delist_date"] and ymd(anniversary) >= b["delist_date"]):
+                continue
+            before = [d for d in calendar if d < ymd(anniversary)]
+            if not before:
+                raise ValueError("Calendar cannot locate the expected coupon record session")
+            expected_record = before[-1]
+            candidates = coupon_groups.get(b["ts_code"], coupons.iloc[:0])
+            notices = candidates[(candidates.ex_timestamp-anniversary).dt.days.abs().le(15)]
+            exposed = (expected_record, b["ts_code"]) in held
+            status = "verified_notice" if len(notices) == 1 else "not_held_on_expected_record"
+            if len(notices) > 1 or (notices.empty and exposed):
+                status = "unresolved"
+            rows.append({"ts_code": b["ts_code"], "anniversary": ymd(anniversary),
+                         "expected_record": expected_record, "held": exposed, "status": status})
+    result = pd.DataFrame(rows)
+    result.to_sql("coupon_coverage", db, if_exists="replace", index=False)
+    if (result.status == "unresolved").any():
+        missing = result[result.status == "unresolved"]
+        raise ValueError("Held coupon periods without verified cash flows: " + missing.to_json(orient="records"))
+    return result
 
 
 def crosscheck(db, code, end, offline=False):
@@ -583,7 +1063,7 @@ def export(db, out, args):
     import matplotlib.pyplot as plt
     out.mkdir(parents=True, exist_ok=True)
     names = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-    for table in ["signals", "curve", "nav", "trades", "issues", "crosscheck", "benchmark"]:
+    for table in ["signals", "curve", "nav", "trades", "issues", "crosscheck", "benchmark", "coupons", "coupon_ledger", "coupon_coverage", "announcement_risks", "announcement_coverage", "announcement_reviews", "corporate_action_state"]:
         if table in names:
             pd.read_sql_query(f"SELECT * FROM {table}", db).to_csv(out / (table + ".csv"), index=False, encoding="utf-8-sig")
     nav = pd.read_sql_query("SELECT * FROM nav ORDER BY trade_date,style", db)
@@ -608,13 +1088,13 @@ def export(db, out, args):
         metrics.append(row)
         frame = frame.assign(daily_return=returns, year=frame.trade_date.str[:4])
         for year, group in frame.groupby("year"):
-            annual.append({"year": year, "style": style, "price_return": float((1 + group.daily_return).prod() - 1) if group.valid.all() else None})
+            annual.append({"year": year, "style": style, "return": float((1 + group.daily_return).prod() - 1) if group.valid.all() else None})
         dates = pd.to_datetime(frame.trade_date)
         line = {"color": "black", "linestyle": "--", "linewidth": 2.2, "zorder": 5} if style == "csi_cb" else {}
         label = "CSI Convertible Bond (000832.CSI)" if style == "csi_cb" else style
         axes[0].plot(dates, np.where(frame.valid, values, np.nan), label=label, **line)
         axes[1].plot(dates, np.where(frame.valid, drawdown, np.nan), **line)
-    axes[0].set_title("Five weekly CB styles vs CSI Convertible Bond Index\nInitial capital = 1 at first session open | strategies exclude regular coupons")
+    axes[0].set_title("Five weekly CB styles vs CSI Convertible Bond Index\nInitial capital = 1 at first session open | gross coupons included, net of trading costs")
     axes[0].set_ylabel("NAV"); axes[0].legend(ncol=3)
     axes[1].set_ylabel("Drawdown")
     for axis in axes:
@@ -634,27 +1114,181 @@ def export(db, out, args):
         SUM(cb_value IS NOT NULL AND cb_value>0)*1.0/COUNT(*) AS parity_coverage
         FROM bars GROUP BY year""", db)
     coverage.to_csv(out / "coverage.csv", index=False, encoding="utf-8-sig")
+    issues = pd.read_sql_query("SELECT * FROM issues", db)
+    issues.groupby("issue").size().reset_index(name="observations").to_csv(out / "issue_summary.csv", index=False, encoding="utf-8-sig")
+    issues[issues.issue.str.contains("unresolved")].groupby(["ts_code", "issue"]).size().reset_index(name="observations").to_csv(out / "unresolved_summary.csv", index=False, encoding="utf-8-sig")
+    ledger = pd.read_sql_query("SELECT * FROM coupon_ledger", db)
+    summary = ledger.groupby(["style", "event"]).agg(events=("amount", "size"), amount=("amount", "sum")).reset_index()
+    summary.to_csv(out / "coupon_summary.csv", index=False, encoding="utf-8-sig")
     manifest = {"generated_at": datetime.now().astimezone().isoformat(), "start": args.start, "end": args.end,
                 "frequency": "weekly", "signal": "prior session close", "execution": "next week first session open",
                 "one_way_cost_bps": args.cost_bps, "fraction": args.fraction,
                 "benchmark": {"code": "000832.CSI", "source": "Tushare index_daily", "normalization": "close / first session open",
                               "fees_bps": 0, "missing_dates": "fail; never fill or shorten the interval",
-                              "methodology": "Official full-price index; strategies exclude regular coupon cash flows"},
+                              "methodology": "Published official index levels; no synthetic coupon adjustment"},
+                "coupons": {"basis": "gross, before investor-specific income tax", "entitlement": "record-date closing quantity",
+                            "recognition": "ex-date receivable; no double counting in full-price record-date mark",
+                            "payment": "cash at payment-date close; available for subsequent trades",
+                            "source": "CNInfo issuer payment PDFs; annual held-period coverage checked"},
                 "risk_policy": {"price_floor": 90, "stock_ST_or_delisting": "exclude and exit", "unknown_name_history": "exclude",
                                 "redemption_and_trading_termination": "exclude and exit after announcement", "announcement_lag": "next calendar day, executed on next trading session",
                                 "risk_exit_frequency": "daily", "normal_rebalance": "weekly"},
-                "limitations": ["Regular coupons excluded; not total return", "Daily data cannot guarantee open auction fills or capacity",
+                "limitations": ["Investor-specific taxes excluded; benchmark uses published official levels", "Daily data cannot guarantee open auction fills or capacity",
                                 "Provider history can be revised; no original-release vintage guarantee",
                                 "Unresolved held marks invalidate subsequent performance; inspect issues.csv"],
                 "sources": [{"source": r[0], "cache_entries": r[1], "last_fetched_at": r[2]} for r in
                             db.execute("SELECT source,count(*),max(fetched_at) FROM cache GROUP BY source")]}
+    manifest["corporate_actions"] = pd.read_sql_query("SELECT * FROM corporate_action_state", db).iloc[0].to_dict()
+    manifest["checks"] = {"portfolio_nav_rows": int((nav['style'] != 'csi_cb').sum()),
+        "rebalance_dates": int(db.execute("SELECT count(DISTINCT execution_date) FROM signals").fetchone()[0]),
+        "unresolved_valuations": int(issues.issue.str.contains("unresolved").sum()),
+        "unresolved_coupon_periods": int(db.execute("SELECT count(*) FROM coupon_coverage WHERE status='unresolved'").fetchone()[0]),
+        "coupon_payments": int((ledger.event == "coupon_payment").sum()),
+        "coupon_receivable_entries": int((ledger.event == "coupon_receivable").sum())}
     (out / "run.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(pd.DataFrame(metrics).to_string(index=False), flush=True)
+
+
+def publish_results(out):
+    manifest = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    metrics = pd.read_csv(out / "metrics.csv").set_index("style")
+    comparison = pd.read_csv(out / "comparison_nav.csv", index_col="trade_date")
+    expected = set(STYLES) | {"csi_cb"}
+    if set(metrics.index) != expected or not metrics.valid.all() or set(comparison.columns) != expected:
+        raise ValueError("Publication requires five valid portfolios and the benchmark")
+    if not np.isfinite(comparison.to_numpy()).all() or (comparison <= 0).any().any() or comparison.index.duplicated().any():
+        raise ValueError("Invalid comparison NAVs; public files were not changed")
+    if not metrics.sessions.eq(len(comparison)).all() or metrics.end.nunique() != 1:
+        raise ValueError("Benchmark and portfolio intervals differ")
+    if manifest["corporate_actions"]["end"] != manifest["end"] or manifest["corporate_actions"]["status"] != "complete":
+        raise ValueError("Corporate actions have not been refreshed through the research cutoff")
+    checks = manifest["checks"]
+    if checks["unresolved_valuations"] or checks["unresolved_coupon_periods"]:
+        raise ValueError("Unresolved valuation or coupon periods block publication")
+    files = ["metrics.csv", "annual_returns.csv", "coverage.csv", "crosscheck.csv", "run.json", "issue_summary.csv",
+             "unresolved_summary.csv", "weekly_styles.png", "premium_at_100.png", "comparison_nav.csv", "coupons.csv",
+             "coupon_summary.csv", "coupon_coverage.csv", "announcement_risks.csv", "announcement_coverage.csv",
+             "announcement_reviews.csv", "corporate_action_state.csv"]
+    for name in files:
+        if not (out / name).is_file():
+            raise ValueError(f"Missing publication artifact: {name}")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    first = pd.Timestamp(str(metrics.start.iloc[0])).strftime("%Y-%m-%d")
+    last = pd.Timestamp(str(metrics.end.iloc[0])).strftime("%Y-%m-%d")
+    english = {"equity":"Equity-like", "bond":"Bond-like", "low_price":"Low-price", "double_low":"Double-low", "balanced":"Balanced", "csi_cb":"CSI Convertible Bond (000832.CSI)"}
+    chinese = {**STYLES, "csi_cb":"中证转债指数（000832.CSI）"}
+    for lang, labels in [("ZH", chinese), ("EN", english)]:
+        lines = ([f"共同区间为 **{first}—{last}**，共 **{len(comparison):,} 个交易日、{checks['rebalance_dates']} 个正常建仓/调仓日**。组合计入税前票息及已识别赎回，扣除单边 {manifest['one_way_cost_bps']:g}bp 交易摩擦；年化按 252 个交易日计算。", "", "| 组合 | 累计收益 | 年化收益 | 年化波动率 | 最大回撤 |"] if lang == "ZH" else
+                 [f"Common interval: **{first} to {last}**, **{len(comparison):,} sessions and {checks['rebalance_dates']} initial-entry/rebalance dates**. Portfolios include gross coupons and identified redemptions, net of {manifest['one_way_cost_bps']:g}bp one-way friction; annualization uses 252 sessions.", "", "| Portfolio | Cumulative return | Annualized return | Annualized volatility | Max drawdown |"])
+        lines.append("|---|---:|---:|---:|---:|")
+        for style, label in labels.items():
+            values = " | ".join(f"{metrics.loc[style,field]:.2%}" for field in ["total_return","annual_return","annual_volatility","max_drawdown"])
+            lines.append(f"| {label} | {values} |")
+        if lang == "ZH":
+            lines += ["", f"已核验 {checks['portfolio_nav_rows']:,} 条组合日净值、{checks['coupon_payments']:,} 笔票息到账。持仓票息期间与估值未解决记录均为 0。"]
+        else:
+            lines += ["", f"Validated {checks['portfolio_nav_rows']:,} portfolio-day NAVs and {checks['coupon_payments']:,} coupon payments. No unresolved held coupon periods or valuation entries remain."]
+        pattern = rf"<!-- RESULTS_{lang}:START -->.*?<!-- RESULTS_{lang}:END -->"
+        replacement = f"<!-- RESULTS_{lang}:START -->\n" + "\n".join(lines) + f"\n<!-- RESULTS_{lang}:END -->"
+        readme, count = re.subn(pattern, lambda match: replacement, readme, flags=re.S)
+        if count != 1:
+            raise ValueError(f"README requires one {lang} results block")
+    readme = re.sub(r"数据截止-\d{4}--\d{2}--\d{2}", "数据截止-" + last.replace("-","--"), readme)
+    readme = re.sub(r"Data through \d{4}-\d{2}-\d{2}", "Data through " + last, readme)
+    readme = re.sub(r"--end \d{8}", "--end " + last.replace("-",""), readme)
+    examples = ROOT / "examples"
+    examples.mkdir(exist_ok=True)
+    for name in files:
+        shutil.copyfile(out / name, examples / name)
+    (ROOT / "README.md").write_text(readme, encoding="utf-8")
+    print(f"Published complete local examples and bilingual README through {last}", flush=True)
 
 
 def self_test():
     import unittest
     class Contracts(unittest.TestCase):
+        def coupon_fixture(self):
+            db = sqlite3.connect(":memory:")
+            dates = ["20251013", "20251014", "20251020"]
+            pd.DataFrame({"cal_date": dates}).to_sql("calendar", db, index=False)
+            pd.DataFrame([{"trade_date": d, "ts_code": c, "open": p, "close": p, "vol": 1.}
+                for d,p in zip(dates,[100.,99.,99.]) for c in ["A","B"]]).to_sql("bars",db,index=False)
+            db.execute("CREATE TABLE redemptions (ts_code TEXT PRIMARY KEY,ann_date TEXT,record_date TEXT,payment_date TEXT,price REAL,source TEXT)")
+            sig = pd.DataFrame([{"style": st, "execution_date": dates[0], "ts_code": "A"} for st in STYLES])
+            coupons = pd.DataFrame([{"ts_code": "A", "record_date": dates[0], "ex_date": dates[1],
+                "payment_date": dates[2], "gross_per_bond": 1., "ann_date": "20251010", "source": "fixture"}])
+            return db, dates, sig, coupons
+        def test_coupon_registration_ex_and_payment(self):
+            db, dates, sig, coupons = self.coupon_fixture()
+            result = backtest(db,sig,dates[0],dates[-1],0.,True,{},coupons)
+            nav = result['nav'].query("style == 'equity'")
+            np.testing.assert_allclose(nav.nav,[1.,1.,1.])
+            np.testing.assert_allclose(nav.cash,[0.,0.,.01])
+            np.testing.assert_allclose(nav.coupon_receivable,[0.,.01,0.])
+            self.assertEqual(len(result['coupon_ledger'].query("event == 'coupon_payment'")),5)
+        def test_coupon_entitlement_survives_ex_date_sale(self):
+            db, dates, sig, coupons = self.coupon_fixture()
+            result = backtest(db,sig,dates[0],dates[-1],0.,True,{dates[1]:{'A'}},coupons)
+            nav = result['nav'].query("style == 'equity'")
+            np.testing.assert_allclose(nav.nav,[1.,1.,1.])
+            np.testing.assert_allclose(nav.cash,[0.,.99,1.])
+        def test_ex_date_buyer_has_no_coupon(self):
+            db, dates, sig, coupons = self.coupon_fixture()
+            sig['execution_date'] = dates[1]
+            result = backtest(db,sig,dates[0],dates[-1],0.,True,{},coupons)
+            self.assertTrue(result['coupon_ledger'].empty)
+            np.testing.assert_allclose(result['nav'].nav,1.)
+        def test_payment_not_available_before_close(self):
+            db, dates, sig, coupons = self.coupon_fixture()
+            new = pd.DataFrame([{"style": st,"execution_date":dates[-1],"ts_code":"B"} for st in STYLES])
+            result = backtest(db,pd.concat([sig,new]),dates[0],dates[-1],0.,True,{},coupons)
+            purchase = result['trades'].query("style == 'equity' and ts_code == 'B'")
+            self.assertAlmostEqual(purchase.quantity_change.iloc[0],.01)
+            self.assertAlmostEqual(result['nav'].query("style == 'equity'").cash.iloc[-1],.01)
+        def test_coupon_redemption_overlap_is_error(self):
+            db, dates, sig, coupons = self.coupon_fixture()
+            db.execute("INSERT INTO redemptions VALUES ('A','20251010','20251013','20251020',101,'test')")
+            with self.assertRaisesRegex(ValueError,'overlaps'):
+                backtest(db,sig,dates[0],dates[-1],0.,True,{},coupons)
+        def test_coupon_parser_lot_units_and_late_cash(self):
+            n={'ann_date':'20251010','announcementId':'test','announcementTitle':'转债付息公告','source':'test'}
+            text='债券代码：123001；债权登记日：2025年10月13日；除息日：2025年10月14日；兑息发放日：2025年10月20日；每10张转债（每张面值为100.00元，10张合计1000元）派发利息10元（含税）。'
+            c=parse_coupon(n,text,{'123001':'123001.SZ'})
+            self.assertEqual(c['gross_per_bond'],1.)
+            self.assertEqual(c['payment_date'],'20251020')
+            self.assertEqual(c['ex_date'],'20251014')
+        def test_risk_notice_classification(self):
+            self.assertEqual(risk_notice_type('关于不提前赎回某转债的公告'),('redemption',0))
+            self.assertEqual(risk_notice_type('关于某转债赎回实施的公告'),('redemption',1))
+            self.assertEqual(risk_notice_type('关于某转债停止交易的公告'),('trading_termination',1))
+            self.assertEqual(risk_notice_type('关于希望转2赎回实施的公告'),('redemption',1))
+            self.assertEqual(risk_notice_type('关于新乳转债不提前赎回的公告'),('redemption',0))
+            self.assertIsNone(risk_notice_type('关于某转债预计触发强赎条件的公告'))
+            self.assertIsNone(risk_notice_type('关于可转债募集资金现金管理赎回的公告'))
+        def test_held_coupon_coverage_and_amount_guards(self):
+            db, dates, sig, coupons = self.coupon_fixture()
+            backtest(db,sig,dates[0],dates[-1],0.,True,{},coupons)
+            pd.DataFrame([{'ts_code':'A','value_date':'20241014','maturity_date':'20301014',
+                'pay_per_year':1,'delist_date':'','rate_clause':'第一年1%，第二年2%'}]).to_sql('coupon_bonds',db,index=False)
+            coupons.to_sql('coupons',db,index=False)
+            self.assertTrue(check_coupon_coverage(db,dates[0],dates[-1]).status.eq('verified_notice').all())
+            db.execute('UPDATE coupons SET gross_per_bond=10')
+            with self.assertRaisesRegex(ValueError,'disagrees'):
+                check_coupon_coverage(db,dates[0],dates[-1])
+            db.execute('DELETE FROM coupons')
+            with self.assertRaisesRegex(ValueError,'without verified'):
+                check_coupon_coverage(db,dates[0],dates[-1])
+        def test_coupon_parenthesized_payment_date(self):
+            n={'ann_date':'20201102','announcementId':'test','announcementTitle':'转债付息公告','source':'test'}
+            text='债券代码：113520；债权登记日：2020年11月6日；除息日：2020年11月9日；付息日（兑息发放日）：2020年11月9日；每张转债兑息0.70元（含税）。'
+            self.assertEqual(parse_coupon(n,text,{'113520':'113520.SH'})['payment_date'],'20201109')
+        def test_coupon_correction_keeps_original_amount(self):
+            old={'ts_code':'A','ann_date':'20200121','record_date':'20200131','ex_date':'20200203','payment_date':'20200203','gross_per_bond':1.,'announcement_id':'1','source':'original'}
+            new={**old,'ann_date':'20200130','record_date':'20200203','ex_date':'20200204','payment_date':'20200204','gross_per_bond':None,'announcement_id':'2','source':'correction'}
+            rows=normalize_coupons([old,new])
+            self.assertEqual(len(rows),1)
+            self.assertEqual(rows.iloc[0].gross_per_bond,1.)
+            self.assertEqual(rows.iloc[0].record_date,'20200203')
         def test_benchmark_open_anchor_and_missing_data(self):
             frame = pd.DataFrame({"trade_date": ["20251013", "20251014"], "open": [100., 110.], "close": [110., 99.]})
             dates = frame.trade_date.tolist()
@@ -787,7 +1421,7 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "sync", "research", "self-test", "week-check"])
+    parser.add_argument("command", choices=["run", "sync", "research", "self-test", "week-check", "publish"])
     parser.add_argument("--start", default="20190101")
     parser.add_argument("--end", help="YYYYMMDD; yesterday for research, today for week-check (Asia/Shanghai)")
     parser.add_argument("--db", type=Path, default=ROOT / "data/research.sqlite")
@@ -800,6 +1434,8 @@ def main():
     args = parser.parse_args()
     if args.command == "self-test":
         self_test(); return
+    if args.command == "publish":
+        publish_results(args.out); return
     if args.end is None:
         today = pd.Timestamp(datetime.now(ZoneInfo("Asia/Shanghai")).date())
         args.end = ymd(today if args.command == "week-check" else today - pd.Timedelta(days=1))
@@ -808,7 +1444,11 @@ def main():
         parser.error("Invalid date interval, fraction, or cost")
     with connect(args.db) as db:
         if args.command == "week-check":
-            print(json.dumps(check_week(db, args.end, args.offline))); return
+            decision = check_week(db, args.end, args.offline)
+            if os.environ.get("GITHUB_OUTPUT"):
+                with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                    output.write(f"date={decision['date']}\nshould_update={str(decision['should_update']).lower()}\n")
+            print(json.dumps(decision)); return
         if args.command in ("run", "sync"):
             sync(db, args.start, args.end, args.offline, args.reuse_repo)
         if args.command in ("run", "research"):
@@ -816,11 +1456,14 @@ def main():
             if not bounds or args.start < bounds[0] or args.end > bounds[1]:
                 raise ValueError("Requested research dates exceed synchronized history; run sync first")
             sync_benchmark(db, args.start, args.end, args.offline)
+            sync_corporate_actions(db, args.start, args.end, args.offline)
             apply_quote_overrides(db)
             risk_blocks = prepare_risk(db, args.end, args.offline)
             signals = build_signals(db, args.start, args.end, args.fraction, risk=True)
             fit_curve(db)
-            backtest(db, signals, args.start, args.end, args.cost_bps / 10000, args.offline, risk_blocks)
+            coupons = pd.read_sql_query("SELECT * FROM coupons", db)
+            backtest(db, signals, args.start, args.end, args.cost_bps / 10000, args.offline, risk_blocks, coupons)
+            check_coupon_coverage(db, args.start, args.end)
             crosscheck(db, args.check_code, args.end, args.offline)
             export(db, args.out, args)
 

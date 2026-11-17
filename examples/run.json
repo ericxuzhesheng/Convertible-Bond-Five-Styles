@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-17T19:33:10.513270+08:00",
+  "generated_at": "2026-11-17T21:36:36.897504+08:00",
   "start": "20190101",
   "end": "20261116",
   "frequency": "weekly",
@@ -13,7 +13,14 @@
     "normalization": "close / first session open",
     "fees_bps": 0,
     "missing_dates": "fail; never fill or shorten the interval",
-    "methodology": "Official full-price index; strategies exclude regular coupon cash flows"
+    "methodology": "Published official index levels; no synthetic coupon adjustment"
+  },
+  "coupons": {
+    "basis": "gross, before investor-specific income tax",
+    "entitlement": "record-date closing quantity",
+    "recognition": "ex-date receivable; no double counting in full-price record-date mark",
+    "payment": "cash at payment-date close; available for subsequent trades",
+    "source": "CNInfo issuer payment PDFs; annual held-period coverage checked"
   },
   "risk_policy": {
     "price_floor": 90,
@@ -25,7 +32,7 @@
     "normal_rebalance": "weekly"
   },
   "limitations": [
-    "Regular coupons excluded; not total return",
+    "Investor-specific taxes excluded; benchmark uses published official levels",
     "Daily data cannot guarantee open auction fills or capacity",
     "Provider history can be revised; no original-release vintage guarantee",
     "Unresolved held marks invalidate subsequent performance; inspect issues.csv"
@@ -42,9 +49,39 @@
       "last_fetched_at": "2026-11-17T17:17:08.615879+08:00"
     },
     {
+      "source": "cninfo.announcements",
+      "cache_entries": 63,
+      "last_fetched_at": "2026-11-17T21:34:50.692702+08:00"
+    },
+    {
+      "source": "cninfo.issuer_coupons",
+      "cache_entries": 161,
+      "last_fetched_at": "2026-11-17T21:22:56.640869+08:00"
+    },
+    {
+      "source": "cninfo.issuers",
+      "cache_entries": 1,
+      "last_fetched_at": "2026-11-17T21:12:47.739067+08:00"
+    },
+    {
+      "source": "cninfo.pdf_text",
+      "cache_entries": 2656,
+      "last_fetched_at": "2026-11-17T21:34:55.066154+08:00"
+    },
+    {
+      "source": "eastmoney.redemptions",
+      "cache_entries": 1,
+      "last_fetched_at": "2026-11-17T20:30:17.569985+08:00"
+    },
+    {
       "source": "tushare.cb_basic",
-      "cache_entries": 3,
-      "last_fetched_at": "2026-11-17T18:37:13.010116+08:00"
+      "cache_entries": 4,
+      "last_fetched_at": "2026-11-17T20:09:53.136157+08:00"
+    },
+    {
+      "source": "tushare.cb_call",
+      "cache_entries": 2,
+      "last_fetched_at": "2026-11-17T20:30:34.811469+08:00"
     },
     {
       "source": "tushare.cb_daily",
@@ -76,5 +113,21 @@
       "cache_entries": 5,
       "last_fetched_at": "2026-11-17T19:33:06.047400+08:00"
     }
-  ]
+  ],
+  "corporate_actions": {
+    "start": "20190101",
+    "end": "20261116",
+    "notices": 13948,
+    "coupons": 2570,
+    "risk_events": 11395,
+    "status": "complete"
+  },
+  "checks": {
+    "portfolio_nav_rows": 9540,
+    "rebalance_dates": 404,
+    "unresolved_valuations": 0,
+    "unresolved_coupon_periods": 0,
+    "coupon_payments": 1175,
+    "coupon_receivable_entries": 1175
+  }
 }

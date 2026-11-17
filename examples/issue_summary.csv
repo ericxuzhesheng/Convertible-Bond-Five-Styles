@@ -1,6 +1,5 @@
-issue,observations
+﻿issue,observations
 confirmed_halt_stale_mark,61
-entry_unfilled_cash_slot,35
-nontrading_provider_mark,718
-redemption_pending_stale_mark,1
-risk_exit_frozen,307
+entry_unfilled_cash_slot,40
+nontrading_provider_mark,690
+risk_exit_frozen,310

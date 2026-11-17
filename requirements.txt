@@ -5,3 +5,4 @@ akshare==1.20.65
 statsmodels==0.15.0
 matplotlib==3.11.2
 tzdata
+pypdf==7.1.0
