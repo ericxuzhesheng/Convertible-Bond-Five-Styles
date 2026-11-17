@@ -30,7 +30,7 @@
 
 ## 项目概述
 
-本项目研究中国可转债的偏股、偏债、低价、双低和平衡五类风格，比较统一风险约束下的周度组合表现，并通过百元平价修正转股溢价率跟踪市场估值变化。风格选券与市场估值分别计算，百元平价指标不直接用于组合择时。
+本项目研究中国可转债的偏股、偏债、低价、双低和平衡五类风格，以中证转债指数（000832.CSI）为基准，比较统一风险约束下的周度组合表现，并通过百元平价修正转股溢价率跟踪市场估值变化。风格选券与市场估值分别计算，百元平价指标不直接用于组合择时。
 
 数据来自 Tushare 与 AKShare，以 SQLite 保存行情、历史公告和持仓账本。取数、因子计算、周度选券、风险退出和每日记账集中在一个 [strategy.py](strategy.py) 中，不依赖 Excel 或 VBA。
 
@@ -73,6 +73,7 @@
 | 低价 | 99.85% | 9.58% | 8.35% | -20.32% |
 | 双低 | 315.64% | 20.70% | 13.36% | -21.14% |
 | 平衡型 | 62.61% | 6.63% | 13.47% | -28.43% |
+| 中证转债指数（000832.CSI） | 54.95% | 5.95% | 10.48% | -18.94% |
 
 [组合指标](examples/metrics.csv) · [年度收益](examples/annual_returns.csv) · [数据覆盖](examples/coverage.csv) · [运行参数与来源](examples/run.json)
 
@@ -80,11 +81,13 @@
 
 ## 关键图表
 
-### 五类风格净值与回撤
+### 五类风格与中证转债指数：净值及回撤
 
-![Five convertible-bond styles: NAV and drawdown](examples/weekly_styles.png)
+![Five convertible-bond styles and CSI Convertible Bond benchmark: NAV and drawdown](examples/weekly_styles.png)
 
-各组合初始资金为 1。图中展示统一风险规则下的完整历史，不代表未过滤的原始五风格组合或事前实盘记录。
+五组合初始资金均为 1，指数为黑色虚线，使用 `当日收盘点位 / 2019-01-02 开盘点位（279.6077）` 归一化，以匹配策略首次建仓时点并保留首日收益。六条曲线覆盖相同的 1,908 个交易日，缺任何指数报价都会报错，不前向填充或缩短区间。[每日比较净值](examples/comparison_nav.csv)可直接复核图表。
+
+指数通过 Tushare `index_daily` 获取，采用官方公布点位，不另扣模拟交易成本。中证[编制方案](https://pdf.dfcfw.com/pdf/H2_AN202502251643475838_1.pdf)采用市值加权、全价计算；策略未完整纳入年度票息，两者并非完全一致的总回报口径。图表用于市场参照，收益差不能直接解释为纯选券超额。策略历史已施加当前风险规则，不是事前实盘记录。
 
 ### 百元平价修正转股溢价率
 
@@ -94,7 +97,7 @@
 
 ## 数据与实现
 
-Tushare 提供历史行情、估值、转股余额公告、交易日历、股票名称变更及停复牌记录。AKShare 用于独立核对和缺失行情补充。历史退市券保留，不用当前存续券名单倒推；两源债底口径存在差异，不自动混用。
+Tushare 提供历史行情、估值、转股余额公告、交易日历、股票名称变更、停复牌记录及中证转债指数日线。AKShare 用于独立核对和缺失行情补充。历史退市券保留，不用当前存续券名单倒推；两源债底口径存在差异，不自动混用。
 
 | 文件或目录 | 内容 |
 |---|---|
@@ -110,7 +113,7 @@ Tushare 提供历史行情、估值、转股余额公告、交易日历、股票
 
 ## 更新与复现
 
-使用 Python 3.11+，安装 [requirements.txt](requirements.txt)，并在本机环境配置 `TUSHARE_TOKEN`。账号需具备 `cb_basic`、`cb_daily`、`cb_share`、`trade_cal`、`namechange`、`suspend_d` 的访问权限。
+使用 Python 3.11+，安装 [requirements.txt](requirements.txt)，并在本机环境配置 `TUSHARE_TOKEN`。账号需具备 `cb_basic`、`cb_daily`、`cb_share`、`trade_cal`、`namechange`、`suspend_d`、`index_daily` 的访问权限。
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -126,13 +129,25 @@ python strategy.py self-test
 
 `--db`、`--out` 分别指定数据库与输出目录，`--cost-bps` 调整单边摩擦，`--fraction` 调整底部分位，`--check-code` 指定核对个券。默认路径相对程序所在目录。`--reuse-repo` 可只读复用另一个转债仓库的赎回快照，并核对日行情覆盖。
 
-当前 11 项测试通过，线上与离线的净值、交易、选券、指标、回归和问题记录一致；日手续费与成交费用汇总一致，现金非负，SQLite 完整性检查通过。
+当前 13 项测试通过（含基准起点、缺价、重复日期及节假日周末判断），线上与离线的净值、交易、选券、指标、回归和问题记录一致；日手续费与成交费用汇总一致，现金非负，SQLite 完整性检查通过。
 
-行情、名称与余额可随日期更新，附带公告文件仍是研究快照。扩展区间或生成后续信号前，需要更新公告事件并重新检查覆盖。
+### 周度自动更新
+
+已在本机 Codex 设置北京时间（Asia/Shanghai）**每周最后一个交易日 18:01**更新。任务在周一至周五 18:01 触发日历检查，仅当日是本周最后交易日才取数和重算；节假日提前结束的一周随之提前，整周休市跳过。此任务依赖本机 Codex 可运行，仓库本身不包含 GitHub Actions 定时器。
+
+```powershell
+python strategy.py week-check
+# should_update 为 true 后，用返回的 date 显式指定截止日
+python strategy.py run --start 20190101 --end YYYYMMDD --out results/weekly_candidate
+```
+
+`week-check` 默认取北京时间今天；其他命令仍默认昨天，因此定时任务必须显式传入当日 `--end`。日历缺失会报错，不回退为固定周五。Tushare 指数[通常在 18 点左右更新](https://tushare.pro/document/1?doc_id=95)，18:01 可能尚未齐备；任务只能在当日数据和公告检查完成后更新公开图表、指标及双语 README，失败保留上一版完整成果并报告。
+
+行情、名称、余额和指数可随日期更新，附带赎回及停止交易公告仍是研究快照。自动任务必须先补查上次截止日之后的公告并记录来源，覆盖不能确认时不得发布新区间。
 
 ## 局限性
 
-收益采用价格收益口径，未完整纳入常规票息。日线开盘成交允许碎份额，未模拟最小交易单位、盘口容量或排队成交。停牌估值可能低估区间波动；数据供应商可能修订历史，不能保证原始发布版本。风险规则在查看历史后确定，尚需未来样本验证，不能将本结果视为预期收益或实盘成交保证。
+目前主要问题是：策略票息处理与全价指数口径仍有差异；后续公告覆盖仍需补查；成交假设尚不等于实盘。收益采用价格收益口径，未完整纳入常规票息。日线开盘成交允许碎份额，未模拟最小交易单位、盘口容量或排队成交。停牌估值可能低估区间波动；数据供应商可能修订历史，不能保证原始发布版本。风险规则在查看历史后确定，尚需未来样本验证，不能将本结果视为预期收益或实盘成交保证。
 
 ## 参考资料
 
@@ -187,6 +202,7 @@ The common interval is **2019-01-02 to 2026-11-16**, with **1,908 sessions and 4
 | Low-price | 99.85% | 9.58% | 8.35% | -20.32% |
 | Double-low | 315.64% | 20.70% | 13.36% | -21.14% |
 | Balanced | 62.61% | 6.63% | 13.47% | -28.43% |
+| CSI Convertible Bond (000832.CSI) | 54.95% | 5.95% | 10.48% | -18.94% |
 
 [Portfolio metrics](examples/metrics.csv) · [Annual returns](examples/annual_returns.csv) · [Coverage](examples/coverage.csv) · [Run parameters and sources](examples/run.json)
 
@@ -194,11 +210,13 @@ All 9,540 portfolio-day accounts pass the current checks, with no unresolved val
 
 ## Key figures
 
-### Portfolio NAV and drawdown
+### Five styles vs CSI Convertible Bond: NAV and drawdown
 
-![Five convertible-bond styles: NAV and drawdown](examples/weekly_styles.png)
+![Five convertible-bond styles and CSI Convertible Bond benchmark: NAV and drawdown](examples/weekly_styles.png)
 
-Each portfolio starts with capital of 1. These are results with the stated risk controls, not the original unfiltered portfolios or a live trading record.
+Portfolios start with capital of 1. The black dashed benchmark is `daily close / first-session open (279.6077 on 2019-01-02)`, matching initial portfolio entry and retaining the first session return. All six series cover the same 1,908 sessions. Missing index dates fail validation; no forward filling or interval truncation is allowed. [Daily comparison NAV](examples/comparison_nav.csv) reproduces the chart.
+
+The benchmark uses published 000832.CSI levels from Tushare `index_daily`, with no simulated trading cost. The official [methodology](https://pdf.dfcfw.com/pdf/H2_AN202502251643475838_1.pdf) uses market-value weights and full prices. Strategies omit regular coupon cash flows, so return conventions are not fully matched and differences are not pure selection alpha. Results apply the stated risk controls retrospectively and are not a live trading record.
 
 ### Market premium at parity 100
 
@@ -212,7 +230,7 @@ The repository includes [dated risk events](risk_events.csv), [verified redempti
 
 ## Updates and reproduction
 
-Use Python 3.11+, install [requirements.txt](requirements.txt), and set `TUSHARE_TOKEN` locally. Access to `cb_basic`, `cb_daily`, `cb_share`, `trade_cal`, `namechange` and `suspend_d` is required.
+Use Python 3.11+, install [requirements.txt](requirements.txt), and set `TUSHARE_TOKEN` locally. Access to `cb_basic`, `cb_daily`, `cb_share`, `trade_cal`, `namechange`, `suspend_d` and `index_daily` is required.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -223,11 +241,19 @@ python strategy.py self-test
 
 Offline reproduction requires a successful online run with matching parameters. Use `--db`, `--out`, `--cost-bps`, `--fraction` and `--check-code` to specify the database, output directory, friction, selection fraction and cross-check bond. Paths default to the script directory. `--reuse-repo` optionally reads another repository's redemption snapshot and checks daily coverage.
 
-The current 11 tests pass. Online and offline NAV, trades, selections, metrics, regressions and issue records agree. Fee ledgers reconcile, cash is nonnegative and SQLite integrity passes. The announcement files are research snapshots and must be refreshed before extending the period or using future signals.
+The current 13 tests pass, including benchmark normalization, missing/duplicate dates and holiday-aware last-session checks. Online and offline NAV, trades, selections, metrics, regressions and issue records agree. Fee ledgers reconcile, cash is nonnegative and SQLite integrity passes. The benchmark covers all 1,908 sessions and reproduces offline; the existing five portfolio metrics are unchanged.
+
+### Weekly automation
+
+A local Codex task checks the exchange calendar at **18:01 Asia/Shanghai, Monday through Friday**, and updates only on the week’s final trading session. Holiday-shortened weeks run earlier; fully closed weeks are skipped. This requires the local Codex runtime; no GitHub Actions scheduler is installed.
+
+Run `python strategy.py week-check` first. When its JSON reports `should_update=true`, pass the returned `date` explicitly to `python strategy.py run --start 20190101 --end YYYYMMDD --out results/weekly_candidate`. The calendar check defaults to today in Beijing; research commands still default to yesterday. Missing calendar data is an error.
+
+Index data are [normally updated around 18:00](https://tushare.pro/document/1?doc_id=95), so an 18:01 run can encounter publication delays. Only complete, verified results may replace published examples and bilingual README figures. Failures retain the previous complete publication and are reported. Redemption/termination files remain research snapshots: the task must check subsequent announcements and preserve their dates and sources before extending the sample; unconfirmed coverage blocks publication.
 
 ## Limitations
 
-These are price-return research estimates, not complete coupon-inclusive total returns. Daily-open fills allow fractional quantities and do not model lot sizes, order-book capacity or execution queues. Carried suspension marks can understate interim volatility. Provider revisions prevent an original-release-vintage guarantee. Risk rules were specified after examining history and require future-sample evaluation; historical results are not expected returns or guaranteed fills.
+The main remaining issues are coupon conventions versus the full-price index, announcement coverage for future updates, and execution realism. These are price-return research estimates, not complete coupon-inclusive total returns. Daily-open fills allow fractional quantities and do not model lot sizes, order-book capacity or execution queues. Carried suspension marks can understate interim volatility. Provider revisions prevent an original-release-vintage guarantee. Risk rules were specified after examining history and require future-sample evaluation; historical results are not expected returns or guaranteed fills.
 
 ## References
 

@@ -84,6 +84,68 @@ def unique(frame, keys, name):
         raise ValueError(f"Conflicting duplicate keys in {name}: {keys}")
 
 
+def week_decision(calendar, date):
+    day = pd.Timestamp(date)
+    monday = day - pd.Timedelta(days=day.weekday())
+    expected = {ymd(d) for d in pd.date_range(monday, periods=7)}
+    unique(calendar, ["cal_date"], "weekly calendar")
+    if set(calendar.cal_date) != expected or not calendar.is_open.isin([0, 1]).all():
+        raise ValueError("Weekly calendar is incomplete or invalid; cannot decide the last session")
+    sessions = sorted(calendar.loc[calendar.is_open == 1, "cal_date"])
+    last = sessions[-1] if sessions else None
+    return {"date": ymd(day), "timezone": "Asia/Shanghai", "last_trading_day": last,
+            "should_update": ymd(day) == last}
+
+
+def check_week(db, date, offline=False):
+    import tushare as ts
+    day = pd.Timestamp(date)
+    monday = day - pd.Timedelta(days=day.weekday())
+    pro = None if offline else ts.pro_api(os.environ["TUSHARE_TOKEN"], timeout=40)
+    calendar = paged(db, pro, "trade_cal", {"exchange": "SSE", "_snapshot": date,
+                     "start_date": ymd(monday), "end_date": ymd(monday + pd.Timedelta(days=6)),
+                     "fields": "cal_date,is_open"}, offline)
+    return week_decision(calendar, date)
+
+
+def benchmark_nav(frame, dates):
+    unique(frame, ["trade_date"], "benchmark")
+    if set(frame.trade_date) != set(dates):
+        raise ValueError("Benchmark dates do not exactly cover the portfolio sessions")
+    frame = frame.set_index("trade_date").loc[list(dates)].reset_index()
+    prices = frame[["open", "close"]].apply(pd.to_numeric, errors="raise").to_numpy(dtype=float)
+    if not np.isfinite(prices).all() or (prices <= 0).any():
+        raise ValueError("Benchmark has missing, nonpositive or nonfinite prices")
+    # Portfolios start at the first session OPEN: retain that session's return.
+    return pd.DataFrame({"trade_date": frame.trade_date, "style": "csi_cb",
+                         "nav": prices[:, 1] / prices[0, 0], "valid": 1})
+
+
+def sync_benchmark(db, start, end, offline=False):
+    import tushare as ts
+    pro = None if offline else ts.pro_api(os.environ["TUSHARE_TOKEN"], timeout=40)
+    dates = pd.read_sql_query("SELECT cal_date FROM calendar WHERE cal_date BETWEEN ? AND ? ORDER BY cal_date",
+                             db, params=(start, end)).cal_date.tolist()
+    if not dates:
+        raise ValueError("No portfolio sessions for benchmark comparison")
+    parts = []
+    for year in range(int(dates[0][:4]), int(dates[-1][:4]) + 1):
+        wanted = [d for d in dates if d.startswith(str(year))]
+        if not wanted:
+            continue
+        def fetch(**params):
+            result = pro.index_daily(**params)
+            benchmark_nav(result, wanted)  # Never cache a delayed/incomplete response.
+            if not result.ts_code.eq("000832.CSI").all():
+                raise ValueError("Unexpected benchmark code")
+            return result
+        parts.append(cached(db, "tushare.index_daily", {"ts_code": "000832.CSI", "start_date": wanted[0],
+                            "end_date": wanted[-1], "fields": "ts_code,trade_date,open,close"}, fetch, offline))
+    frame = pd.concat(parts, ignore_index=True).sort_values("trade_date")
+    benchmark_nav(frame, dates)
+    frame.to_sql("benchmark", db, if_exists="replace", index=False)
+
+
 def sync(db, start, end, offline=False, reuse_repo=None):
     import tushare as ts
     token = os.environ.get("TUSHARE_TOKEN")
@@ -521,10 +583,13 @@ def export(db, out, args):
     import matplotlib.pyplot as plt
     out.mkdir(parents=True, exist_ok=True)
     names = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-    for table in ["signals", "curve", "nav", "trades", "issues", "crosscheck"]:
+    for table in ["signals", "curve", "nav", "trades", "issues", "crosscheck", "benchmark"]:
         if table in names:
             pd.read_sql_query(f"SELECT * FROM {table}", db).to_csv(out / (table + ".csv"), index=False, encoding="utf-8-sig")
     nav = pd.read_sql_query("SELECT * FROM nav ORDER BY trade_date,style", db)
+    benchmark = benchmark_nav(pd.read_sql_query("SELECT * FROM benchmark", db), sorted(nav.trade_date.unique()))
+    nav = pd.concat([nav[["trade_date", "style", "nav", "valid"]], benchmark], ignore_index=True)
+    nav.pivot(index="trade_date", columns="style", values="nav").to_csv(out / "comparison_nav.csv", encoding="utf-8-sig")
     metrics, annual = [], []
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     for style, frame in nav.groupby("style"):
@@ -545,9 +610,11 @@ def export(db, out, args):
         for year, group in frame.groupby("year"):
             annual.append({"year": year, "style": style, "price_return": float((1 + group.daily_return).prod() - 1) if group.valid.all() else None})
         dates = pd.to_datetime(frame.trade_date)
-        axes[0].plot(dates, np.where(frame.valid, values, np.nan), label=style)
-        axes[1].plot(dates, np.where(frame.valid, drawdown, np.nan))
-    axes[0].set_title("Weekly CB styles | price return + identified redemptions | no regular coupons")
+        line = {"color": "black", "linestyle": "--", "linewidth": 2.2, "zorder": 5} if style == "csi_cb" else {}
+        label = "CSI Convertible Bond (000832.CSI)" if style == "csi_cb" else style
+        axes[0].plot(dates, np.where(frame.valid, values, np.nan), label=label, **line)
+        axes[1].plot(dates, np.where(frame.valid, drawdown, np.nan), **line)
+    axes[0].set_title("Five weekly CB styles vs CSI Convertible Bond Index\nInitial capital = 1 at first session open | strategies exclude regular coupons")
     axes[0].set_ylabel("NAV"); axes[0].legend(ncol=3)
     axes[1].set_ylabel("Drawdown")
     for axis in axes:
@@ -570,6 +637,9 @@ def export(db, out, args):
     manifest = {"generated_at": datetime.now().astimezone().isoformat(), "start": args.start, "end": args.end,
                 "frequency": "weekly", "signal": "prior session close", "execution": "next week first session open",
                 "one_way_cost_bps": args.cost_bps, "fraction": args.fraction,
+                "benchmark": {"code": "000832.CSI", "source": "Tushare index_daily", "normalization": "close / first session open",
+                              "fees_bps": 0, "missing_dates": "fail; never fill or shorten the interval",
+                              "methodology": "Official full-price index; strategies exclude regular coupon cash flows"},
                 "risk_policy": {"price_floor": 90, "stock_ST_or_delisting": "exclude and exit", "unknown_name_history": "exclude",
                                 "redemption_and_trading_termination": "exclude and exit after announcement", "announcement_lag": "next calendar day, executed on next trading session",
                                 "risk_exit_frequency": "daily", "normal_rebalance": "weekly"},
@@ -585,6 +655,32 @@ def export(db, out, args):
 def self_test():
     import unittest
     class Contracts(unittest.TestCase):
+        def test_benchmark_open_anchor_and_missing_data(self):
+            frame = pd.DataFrame({"trade_date": ["20251013", "20251014"], "open": [100., 110.], "close": [110., 99.]})
+            dates = frame.trade_date.tolist()
+            np.testing.assert_allclose(benchmark_nav(frame.iloc[::-1], dates).nav, [1.1, .99])
+            with self.assertRaises(ValueError):
+                benchmark_nav(frame.iloc[:1], dates)
+            with self.assertRaises(ValueError):
+                benchmark_nav(pd.concat([frame, frame.iloc[:1]]), dates)
+            for price in [0., np.nan, np.inf]:
+                broken = frame.copy()
+                broken.loc[0, "open"] = price
+                with self.assertRaises(ValueError):
+                    benchmark_nav(broken, dates)
+        def test_last_trading_day_gate(self):
+            calendar = pd.DataFrame({"cal_date": [ymd(d) for d in pd.date_range('20251006', periods=7)],
+                                     "is_open": [0, 0, 0, 1, 1, 0, 0]})
+            self.assertFalse(week_decision(calendar, '20251009')['should_update'])
+            self.assertTrue(week_decision(calendar, '20251010')['should_update'])
+            calendar.loc[4, 'is_open'] = 0
+            self.assertTrue(week_decision(calendar, '20251009')['should_update'])
+            self.assertFalse(week_decision(calendar, '20251010')['should_update'])
+            calendar['is_open'] = 0
+            self.assertIsNone(week_decision(calendar, '20251010')['last_trading_day'])
+            self.assertFalse(week_decision(calendar, '20251010')['should_update'])
+            with self.assertRaises(ValueError):
+                week_decision(calendar.iloc[:5], '20251010')
         def test_risk_information_delay(self):
             self.assertEqual(risk_available('20251013','20251013'),'20251014')
             self.assertEqual(risk_available('20251010','20251020'),'20251020')
@@ -691,9 +787,9 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "sync", "research", "self-test"])
+    parser.add_argument("command", choices=["run", "sync", "research", "self-test", "week-check"])
     parser.add_argument("--start", default="20190101")
-    parser.add_argument("--end", default=ymd(pd.Timestamp(datetime.now(ZoneInfo("Asia/Shanghai")).date()) - pd.Timedelta(days=1)))
+    parser.add_argument("--end", help="YYYYMMDD; yesterday for research, today for week-check (Asia/Shanghai)")
     parser.add_argument("--db", type=Path, default=ROOT / "data/research.sqlite")
     parser.add_argument("--out", type=Path, default=ROOT / "results")
     parser.add_argument("--fraction", type=float, default=.1)
@@ -704,16 +800,22 @@ def main():
     args = parser.parse_args()
     if args.command == "self-test":
         self_test(); return
+    if args.end is None:
+        today = pd.Timestamp(datetime.now(ZoneInfo("Asia/Shanghai")).date())
+        args.end = ymd(today if args.command == "week-check" else today - pd.Timedelta(days=1))
     args.start, args.end = ymd(args.start), ymd(args.end)
     if args.start > args.end or not 0 < args.fraction <= 1 or not 0 <= args.cost_bps < 1000:
         parser.error("Invalid date interval, fraction, or cost")
     with connect(args.db) as db:
+        if args.command == "week-check":
+            print(json.dumps(check_week(db, args.end, args.offline))); return
         if args.command in ("run", "sync"):
             sync(db, args.start, args.end, args.offline, args.reuse_repo)
         if args.command in ("run", "research"):
             bounds = db.execute("SELECT start,end FROM sync_state").fetchone()
             if not bounds or args.start < bounds[0] or args.end > bounds[1]:
                 raise ValueError("Requested research dates exceed synchronized history; run sync first")
+            sync_benchmark(db, args.start, args.end, args.offline)
             apply_quote_overrides(db)
             risk_blocks = prepare_risk(db, args.end, args.offline)
             signals = build_signals(db, args.start, args.end, args.fraction, risk=True)

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-17T18:43:13.911311+08:00",
+  "generated_at": "2026-11-17T19:33:10.513270+08:00",
   "start": "20190101",
   "end": "20261116",
   "frequency": "weekly",
@@ -7,6 +7,14 @@
   "execution": "next week first session open",
   "one_way_cost_bps": 5.0,
   "fraction": 0.1,
+  "benchmark": {
+    "code": "000832.CSI",
+    "source": "Tushare index_daily",
+    "normalization": "close / first session open",
+    "fees_bps": 0,
+    "missing_dates": "fail; never fill or shorten the interval",
+    "methodology": "Official full-price index; strategies exclude regular coupon cash flows"
+  },
   "risk_policy": {
     "price_floor": 90,
     "stock_ST_or_delisting": "exclude and exit",
@@ -49,6 +57,11 @@
       "last_fetched_at": "2026-11-17T17:13:36.796779+08:00"
     },
     {
+      "source": "tushare.index_daily",
+      "cache_entries": 8,
+      "last_fetched_at": "2026-11-17T19:30:54.284418+08:00"
+    },
+    {
       "source": "tushare.namechange",
       "cache_entries": 8,
       "last_fetched_at": "2026-11-17T18:37:28.785064+08:00"
@@ -60,8 +73,8 @@
     },
     {
       "source": "tushare.trade_cal",
-      "cache_entries": 4,
-      "last_fetched_at": "2026-11-17T17:00:49.611323+08:00"
+      "cache_entries": 5,
+      "last_fetched_at": "2026-11-17T19:33:06.047400+08:00"
     }
   ]
 }
