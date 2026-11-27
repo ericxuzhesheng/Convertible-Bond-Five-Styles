@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/数据存储-SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite">
   <img src="https://img.shields.io/badge/策略-五类转债风格-F2C94C?style=for-the-badge" alt="Five convertible-bond styles">
-  <img src="https://img.shields.io/badge/数据截止-2026--11--16-4CAF50?style=for-the-badge" alt="Data through 2026-11-16">
+  <img src="https://img.shields.io/badge/数据截止-2026--11--20-4CAF50?style=for-the-badge" alt="Data through 2026-11-20">
   <img src="https://img.shields.io/badge/调仓频率-周度-9B51E0?style=for-the-badge" alt="Weekly rebalancing">
 </p>
 
@@ -65,18 +65,18 @@
 ### 全区间表现
 
 <!-- RESULTS_ZH:START -->
-共同区间为 **2019-01-02—2026-11-16**，共 **1,908 个交易日、404 个正常建仓/调仓日**。组合计入税前票息及已识别赎回，扣除单边 5bp 交易摩擦；年化按 252 个交易日计算。
+共同区间为 **2019-01-02—2026-11-20**，共 **1,912 个交易日、404 个正常建仓/调仓日**。组合计入税前票息及已识别赎回，扣除单边 5bp 交易摩擦；年化按 252 个交易日计算。
 
 | 组合 | 累计收益 | 年化收益 | 年化波动率 | 最大回撤 |
 |---|---:|---:|---:|---:|
-| 偏股型 | 489.60% | 26.41% | 23.40% | -31.89% |
-| 偏债型 | 103.67% | 9.85% | 7.43% | -16.47% |
-| 低价 | 109.57% | 10.27% | 8.34% | -19.95% |
-| 双低 | 338.81% | 21.57% | 13.40% | -20.70% |
-| 平衡型 | 68.82% | 7.16% | 13.47% | -27.77% |
-| 中证转债指数（000832.CSI） | 54.95% | 5.95% | 10.48% | -18.94% |
+| 偏股型 | 471.33% | 25.82% | 23.39% | -31.89% |
+| 偏债型 | 101.90% | 9.70% | 7.43% | -16.47% |
+| 低价 | 105.84% | 9.98% | 8.35% | -19.95% |
+| 双低 | 328.10% | 21.13% | 13.40% | -22.64% |
+| 平衡型 | 61.24% | 6.50% | 13.50% | -27.77% |
+| 中证转债指数（000832.CSI） | 49.86% | 5.48% | 10.50% | -21.60% |
 
-已核验 9,540 条组合日净值、1,175 笔票息到账。持仓票息期间与估值未解决记录均为 0。
+已核验 9,560 条组合日净值、1,175 笔票息到账。持仓票息期间与估值未解决记录均为 0。
 <!-- RESULTS_ZH:END -->
 
 [组合指标](examples/metrics.csv) · [年度收益](examples/annual_returns.csv) · [数据覆盖](examples/coverage.csv) · [运行参数与来源](examples/run.json)
@@ -129,13 +129,13 @@ Tushare 提供历史行情、估值、转股余额公告、交易日历、股票
 
 ```powershell
 python -m pip install -r requirements.txt
-python strategy.py run --start 20190101 --end 20261116
+python strategy.py run --start 20190101 --end 20261120
 ```
 
 已有数据库时可单独重算；相同参数在线运行成功后，可离线重现：
 
 ```powershell
-python strategy.py research --start 20190101 --end 20261116 --offline
+python strategy.py research --start 20190101 --end 20261120 --offline
 python strategy.py self-test
 ```
 
@@ -206,18 +206,18 @@ Risk screening precedes ranking. Known underlying ST/delisting status, announced
 One-way friction is **5bp**. Suspended holdings cannot be sold; confirmed suspensions carry the last mark, and resumed quotations capture the price jump. Identified redemptions become receivables and then cash on the relevant dates. Unexplained marks invalidate subsequent performance rather than being replaced by assumed par recovery.
 
 <!-- RESULTS_EN:START -->
-Common interval: **2019-01-02 to 2026-11-16**, **1,908 sessions and 404 initial-entry/rebalance dates**. Portfolios include gross coupons and identified redemptions, net of 5bp one-way friction; annualization uses 252 sessions.
+Common interval: **2019-01-02 to 2026-11-20**, **1,912 sessions and 404 initial-entry/rebalance dates**. Portfolios include gross coupons and identified redemptions, net of 5bp one-way friction; annualization uses 252 sessions.
 
 | Portfolio | Cumulative return | Annualized return | Annualized volatility | Max drawdown |
 |---|---:|---:|---:|---:|
-| Equity-like | 489.60% | 26.41% | 23.40% | -31.89% |
-| Bond-like | 103.67% | 9.85% | 7.43% | -16.47% |
-| Low-price | 109.57% | 10.27% | 8.34% | -19.95% |
-| Double-low | 338.81% | 21.57% | 13.40% | -20.70% |
-| Balanced | 68.82% | 7.16% | 13.47% | -27.77% |
-| CSI Convertible Bond (000832.CSI) | 54.95% | 5.95% | 10.48% | -18.94% |
+| Equity-like | 471.33% | 25.82% | 23.39% | -31.89% |
+| Bond-like | 101.90% | 9.70% | 7.43% | -16.47% |
+| Low-price | 105.84% | 9.98% | 8.35% | -19.95% |
+| Double-low | 328.10% | 21.13% | 13.40% | -22.64% |
+| Balanced | 61.24% | 6.50% | 13.50% | -27.77% |
+| CSI Convertible Bond (000832.CSI) | 49.86% | 5.48% | 10.50% | -21.60% |
 
-Validated 9,540 portfolio-day NAVs and 1,175 coupon payments. No unresolved held coupon periods or valuation entries remain.
+Validated 9,560 portfolio-day NAVs and 1,175 coupon payments. No unresolved held coupon periods or valuation entries remain.
 <!-- RESULTS_EN:END -->
 
 [Portfolio metrics](examples/metrics.csv) · [Annual returns](examples/annual_returns.csv) · [Coverage](examples/coverage.csv) · [Run parameters and sources](examples/run.json)
@@ -258,8 +258,8 @@ Use Python 3.12+, install [requirements.txt](requirements.txt), and set `TUSHARE
 
 ```powershell
 python -m pip install -r requirements.txt
-python strategy.py run --start 20190101 --end 20261116
-python strategy.py research --start 20190101 --end 20261116 --offline
+python strategy.py run --start 20190101 --end 20261120
+python strategy.py research --start 20190101 --end 20261120 --offline
 python strategy.py self-test
 ```
 
