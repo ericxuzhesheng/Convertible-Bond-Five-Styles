@@ -141,11 +141,11 @@ python strategy.py self-test
 
 `--db`、`--out` 分别指定数据库与输出目录，`--cost-bps` 调整单边摩擦，`--fraction` 调整底部分位，`--check-code` 指定核对个券。默认路径相对程序所在目录。`--reuse-repo` 可只读复用另一个转债仓库的赎回快照，并核对日行情覆盖。
 
-23 项内置测试覆盖票息权益、除息记账、延迟付款、赎回防重计、公告更正、基准和周末判断。完整回测另检查持仓票息覆盖、净值有效性和费用账本；离线复现需要相同参数的完整缓存。
+25 项内置测试覆盖票息权益、除息记账、延迟付款、赎回防重计、公告更正、基准、周度截止日和空行情缓存。完整回测另检查持仓票息覆盖、净值有效性和费用账本；离线复现需要相同参数的完整缓存。
 
 ### 周度自动更新
 
-[GitHub Actions](.github/workflows/weekly-update.yml) 在北京时间 **周一至周五 19:01**（UTC 11:01）触发，先查询交易所日历，仅在**每周最后一个交易日**更新；节假日缩短的交易周提前执行，整周休市跳过。GitHub 排队可能使实际启动稍晚。旧本机 18:01 任务停用。
+[GitHub Actions](.github/workflows/weekly-update.yml) 在北京时间 **周一至周五 19:01**（UTC 11:01）触发。定时运行以最近已到的工作日 19:01 所在日期为截止日，即使排队跨过午夜也按该日期查询交易所日历。仅在**每周最后一个交易日**更新，节假日缩短的交易周提前执行，整周休市跳过。旧本机 18:01 任务停用。
 
 仓库 Secret `TUSHARE_TOKEN` 提供接口凭据。任务恢复 SQLite 缓存，自动更新行情、指数、票息和风险公告，运行回测与检查，再用 `publish` 同步图表、指标和双语 README 并提交。失败不会发布部分区间。手动运行支持指定截止日和强制重算；凭据不得写入代码或公开结果。
 
@@ -155,7 +155,7 @@ python strategy.py run --start 20190101 --end YYYYMMDD --out results/weekly_cand
 python strategy.py publish --out results/weekly_candidate
 ```
 
-`week-check` 默认北京时间今天，其他研究命令默认昨天；自动任务显式传入日历检查返回的截止日。日历、当日行情或指数缺失均报错，不默认固定周五、不前向填充。Tushare 公告权限不足或来源暂不可达时，需在 Actions 日志处理失败后重跑。
+手动执行 `week-check` 默认使用北京时间当天，其他研究命令默认使用昨天。自动任务将日历检查返回的截止日传给回测。日历、当日行情或指数缺失均报错，不默认固定周五、不前向填充。Tushare 公告权限不足或来源暂不可达时，需在 Actions 日志处理失败后重跑。
 
 ## 局限性
 
@@ -265,11 +265,11 @@ python strategy.py self-test
 
 Offline reproduction requires a successful online run with matching parameters. Use `--db`, `--out`, `--cost-bps`, `--fraction` and `--check-code` to specify the database, output directory, friction, selection fraction and cross-check bond. Paths default to the script directory. `--reuse-repo` optionally reads another repository's redemption snapshot and checks daily coverage.
 
-The 23 built-in tests cover coupon entitlement, ex-date accounting, delayed payment, redemption overlap, notice corrections, benchmark and weekly calendar checks. Full runs additionally validate held coupon periods, NAV and fee ledgers.
+The 25 built-in tests cover coupon entitlement, ex-date accounting, delayed payment, redemption overlap, notice corrections, the benchmark, weekly cutoffs and empty quote caching. Full runs additionally validate held coupon periods, NAV and fee ledgers.
 
 ### Weekly automation
 
-[GitHub Actions](.github/workflows/weekly-update.yml) triggers at **19:01 Asia/Shanghai (11:01 UTC), Monday–Friday**. The exchange-calendar gate permits updates only on the week's final trading session, including holiday-shortened weeks; fully closed weeks are skipped. GitHub queues may delay the actual start. The former local 18:01 task is disabled.
+[GitHub Actions](.github/workflows/weekly-update.yml) triggers at **19:01 Asia/Shanghai (11:01 UTC), Monday–Friday**. Scheduled runs check the exchange calendar for the most recent elapsed weekday slot, even when the queue crosses midnight. Updates run only on the week's final trading session, including holiday-shortened weeks. Fully closed weeks are skipped. The former local 18:01 task is disabled.
 
 The repository secret `TUSHARE_TOKEN` authenticates requests. The workflow restores the SQLite cache, refreshes prices, index data, coupons and risk announcements, runs research and checks, then publishes figures, metrics and both README result tables. Failures preserve the previous complete publication. Manual dispatch supports an explicit cutoff and forced rebuild. Credentials are never committed. Missing calendar or cutoff data fails validation, without assuming Friday or forward filling.
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
@@ -430,11 +430,13 @@ def connect(path):
     return db
 
 
-def cached(db, source, params, fetch, offline=False):
+def cached(db, source, params, fetch, offline=False, *, cache_empty=True):
     key = source + ":" + json.dumps(params, sort_keys=True, ensure_ascii=True)
     row = db.execute("SELECT payload FROM cache WHERE key=?", (key,)).fetchone()
     if row:
-        return pd.DataFrame(json.loads(row[0])["rows"], columns=json.loads(row[0])["columns"])
+        payload = json.loads(row[0])
+        if cache_empty or payload["rows"] or offline:
+            return pd.DataFrame(payload["rows"], columns=payload["columns"])
     if offline:
         raise ValueError(f"Offline cache missing: {key}")
     # API/auth/schema errors propagate. Only a complete response enters the cache.
@@ -450,9 +452,11 @@ def cached(db, source, params, fetch, offline=False):
             time.sleep(2 ** attempt)
     if not isinstance(frame, pd.DataFrame):
         raise TypeError(f"{source}: expected DataFrame")
-    payload = {"columns": frame.columns.tolist(), "rows": json.loads(frame.to_json(orient="records", date_format="iso"))}
-    with db:
-        db.execute("INSERT INTO cache VALUES (?,?,?,?)", (key, source, datetime.now().astimezone().isoformat(), json.dumps(payload)))
+    if cache_empty or not frame.empty:
+        payload = {"columns": frame.columns.tolist(), "rows": json.loads(frame.to_json(orient="records", date_format="iso"))}
+        with db:
+            db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?,?)",
+                       (key, source, datetime.now().astimezone().isoformat(), json.dumps(payload)))
     if source.startswith("tushare."):
         time.sleep(0.35)
     return frame
@@ -461,8 +465,11 @@ def cached(db, source, params, fetch, offline=False):
 def paged(db, pro, api, params, offline=False):
     pages, offset, previous = [], 0, None
     while True:
+        # A daily quote request can return empty before its session's data arrives.
+        cache_empty = not (api == "cb_daily" and "trade_date" in params and offset == 0)
         page = cached(db, "tushare." + api, {**params, "limit": 2000, "offset": offset},
-                      lambda **kw: pro.query(api, **{k: v for k, v in kw.items() if not k.startswith("_")}), offline)
+                      lambda **kw: pro.query(api, **{k: v for k, v in kw.items() if not k.startswith("_")}),
+                      offline, cache_empty=cache_empty)
         if page.empty:
             break
         signature = page.to_json(orient="records")
@@ -478,6 +485,14 @@ def paged(db, pro, api, params, offline=False):
 def unique(frame, keys, name):
     if frame.duplicated(keys).any():
         raise ValueError(f"Conflicting duplicate keys in {name}: {keys}")
+
+
+def scheduled_cutoff(now):
+    # The weekday cron runs at 19:01 Beijing time (11:01 UTC).
+    day = (now.astimezone(ZoneInfo("Asia/Shanghai")) - timedelta(hours=19, minutes=1)).date()
+    if day.weekday() >= 5:
+        day -= timedelta(days=day.weekday() - 4)
+    return ymd(day)
 
 
 def week_decision(calendar, date):
@@ -575,8 +590,10 @@ def sync(db, start, end, offline=False, reuse_repo=None):
             daily_parts = [paged(db, pro, "cb_daily", {"trade_date": d, "fields": FIELDS}, offline)
                            for d in sorted(expected)]
             frame = pd.concat(daily_parts, ignore_index=True)
-            if set(frame.trade_date) != expected:
-                raise ValueError(f"Incomplete daily repair: {left}..{right}")
+            found = set(frame.trade_date)
+            if found != expected:
+                raise ValueError(f"Incomplete daily repair: {left}..{right}, "
+                                 f"missing sessions: {sorted(expected - found)}, unexpected sessions: {sorted(found - expected)}")
         bars.append(frame)
         print(f"Daily {left}..{right}: {len(frame):,} rows", flush=True)
     bars = pd.concat(bars, ignore_index=True)
@@ -1206,6 +1223,7 @@ def publish_results(out):
 
 def self_test():
     import unittest
+    from unittest.mock import Mock, patch
     class Contracts(unittest.TestCase):
         def coupon_fixture(self):
             db = sqlite3.connect(":memory:")
@@ -1315,6 +1333,37 @@ def self_test():
             self.assertFalse(week_decision(calendar, '20251010')['should_update'])
             with self.assertRaises(ValueError):
                 week_decision(calendar.iloc[:5], '20251010')
+        def test_scheduled_cutoff(self):
+            calendar = pd.DataFrame({"cal_date": [ymd(d) for d in pd.date_range('20261123', periods=7)],
+                                     "is_open": [1, 1, 1, 1, 1, 0, 0]})
+            for now, expected, update in [
+                ("2026-11-26T20:05:15+00:00", "20261126", False),
+                ("2026-11-27T11:00:59+00:00", "20261126", False),
+                ("2026-11-27T11:01:00+00:00", "20261127", True),
+                ("2026-11-27T20:05:15+00:00", "20261127", True),
+                ("2026-11-29T20:05:15+00:00", "20261127", True),
+            ]:
+                with self.subTest(now=now):
+                    cutoff = scheduled_cutoff(datetime.fromisoformat(now))
+                    self.assertEqual(cutoff, expected)
+                    self.assertEqual(week_decision(calendar, cutoff)["should_update"], update)
+            calendar.loc[4, "is_open"] = 0
+            cutoff = scheduled_cutoff(datetime.fromisoformat("2026-11-26T20:05:15+00:00"))
+            self.assertTrue(week_decision(calendar, cutoff)["should_update"])
+        def test_empty_daily_quote_cache_is_refetched(self):
+            params = {"trade_date": "20261127", "fields": FIELDS}
+            empty = pd.DataFrame(columns=FIELDS.split(","))
+            quotes = pd.DataFrame([["113052.SH", "20261127", *([100.] * (len(empty.columns) - 2))]],
+                                  columns=empty.columns)
+            with connect(Path(":memory:")) as db, patch.object(time, "sleep"):
+                pro = Mock()
+                pro.query.side_effect = [empty, quotes]
+                self.assertTrue(paged(db, pro, "cb_daily", params).empty)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM cache").fetchone()[0], 0)
+                cached(db, "tushare.cb_daily", {**params, "offset": 0, "limit": 2000}, lambda **kw: empty)
+                pd.testing.assert_frame_equal(paged(db, pro, "cb_daily", params), quotes)
+                pd.testing.assert_frame_equal(paged(db, None, "cb_daily", params, offline=True), quotes)
+                self.assertEqual(pro.query.call_count, 2)
         def test_risk_information_delay(self):
             self.assertEqual(risk_available('20251013','20251013'),'20251014')
             self.assertEqual(risk_available('20251010','20251020'),'20251020')
@@ -1424,6 +1473,7 @@ def main():
     parser.add_argument("command", choices=["run", "sync", "research", "self-test", "week-check", "publish"])
     parser.add_argument("--start", default="20190101")
     parser.add_argument("--end", help="YYYYMMDD; yesterday for research, today for week-check (Asia/Shanghai)")
+    parser.add_argument("--scheduled", action="store_true", help="Use the latest elapsed weekday schedule for week-check")
     parser.add_argument("--db", type=Path, default=ROOT / "data/research.sqlite")
     parser.add_argument("--out", type=Path, default=ROOT / "results")
     parser.add_argument("--fraction", type=float, default=.1)
@@ -1432,13 +1482,19 @@ def main():
     parser.add_argument("--reuse-repo", type=Path)
     parser.add_argument("--check-code", default="113052.SH")
     args = parser.parse_args()
+    if args.scheduled and args.command != "week-check":
+        parser.error("--scheduled is only valid for week-check")
     if args.command == "self-test":
         self_test(); return
     if args.command == "publish":
         publish_results(args.out); return
     if args.end is None:
-        today = pd.Timestamp(datetime.now(ZoneInfo("Asia/Shanghai")).date())
-        args.end = ymd(today if args.command == "week-check" else today - pd.Timedelta(days=1))
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if args.scheduled:
+            args.end = scheduled_cutoff(now)
+        else:
+            today = now.date()
+            args.end = ymd(today if args.command == "week-check" else today - timedelta(days=1))
     args.start, args.end = ymd(args.start), ymd(args.end)
     if args.start > args.end or not 0 < args.fraction <= 1 or not 0 <= args.cost_bps < 1000:
         parser.error("Invalid date interval, fraction, or cost")

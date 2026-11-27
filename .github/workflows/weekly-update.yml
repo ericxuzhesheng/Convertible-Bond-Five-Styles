@@ -47,7 +47,11 @@ jobs:
           REQUESTED_END: ${{ inputs.end_date }}
         run: |
           args=()
-          if [ -n "$REQUESTED_END" ]; then args+=(--end "$REQUESTED_END"); fi
+          if [ -n "$REQUESTED_END" ]; then
+            args+=(--end "$REQUESTED_END")
+          elif [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            args+=(--scheduled)
+          fi
           python strategy.py week-check "${args[@]}"
       - name: Validate and rebuild
         if: steps.calendar.outputs.should_update == 'true' || inputs.force_update == true
