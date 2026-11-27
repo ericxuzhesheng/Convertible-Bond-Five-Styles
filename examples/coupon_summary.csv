@@ -10,7 +10,7 @@ double_low,coupon_receivable,212,0.1547663439858216
 double_low,entitlement_locked,212,0.1547663439858216
 equity,coupon_payment,229,0.16224090811111738
 equity,coupon_receivable,229,0.16224090811111738
-equity,entitlement_locked,229,0.16224090811111738
+equity,entitlement_locked,230,0.16254536054722574
 low_price,coupon_payment,253,0.07736215623544591
 low_price,coupon_receivable,253,0.07736215623544591
-low_price,entitlement_locked,253,0.07736215623544591
+low_price,entitlement_locked,254,0.07847922859710463
